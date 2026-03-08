@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y shellcheck make sed
+
+    - name: Build scripts
+      run: make
+
+    - name: Run linting (check)
+      run: make check
+
+    - name: Verify distribution package creation
+      run: |
+        make dist
+        ls -lh s6-openrc-compat-*.tar.gz
+
+  release:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y make sed
+
+    - name: Create distribution package
+      run: |
+        if [[ $GITHUB_REF == refs/tags/v* ]]; then
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "Building version $VERSION from tag"
+          make dist VERSION=$VERSION
+        else
+          echo "Building version from Makefile"
+          make dist
+        fi
+
+    - name: Generate SHA-512 checksum
+      run: |
+        for f in s6-openrc-compat-*.tar.gz; do
+          sha512sum "$f" > "$f.sha512"
+        done
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          s6-openrc-compat-*.tar.gz
+          s6-openrc-compat-*.tar.gz.sha512
+        draft: false
+        prerelease: false
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
