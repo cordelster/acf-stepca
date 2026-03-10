@@ -56,7 +56,7 @@
 	<% end %>
 </div>
 <div class="form-group">
-	<a href="<%= html.html_escape(page_info.script .. page_info.prefix .. page_info.controller .. "/templates") %>"
+	<a href="<%= html.html_escape(page_info.script .. page_info.prefix .. page_info.controller .. "/provisioners") %>"
 		class="btn btn-primary">
 		View All Provisioners
 	</a>
@@ -215,21 +215,37 @@ kanidm system oauth2 show-basic-secret step-ca</pre>
 
 	<fieldset id="sshpop-help" style="margin-top: 30px; display: none;">
 		<legend>SSHPOP Provisioner Information</legend>
-		<p><strong>SSHPOP (SSH Proof of Possession)</strong> allows users to get X.509 certificates using their SSH keys.</p>
-		<ul>
-			<li>No additional configuration required</li>
-			<li>Users authenticate with existing SSH keys</li>
-			<li>Issues X.509 certificates based on SSH key identity</li>
-			<li>Useful for converting SSH-based infrastructure to certificate-based</li>
-		</ul>
-		<p><small style="color: #777;">Users run: <code>step ca certificate &lt;name&gt; &lt;cert&gt; &lt;key&gt; --provisioner sshpop --ssh-pop-cert ~/.ssh/id_ed25519-cert.pub --ssh-pop-key ~/.ssh/id_ed25519</code></small></p>
+		<% if view.has_ssh and view.has_ssh.value == "false" then %>
+		<div class="alert alert-danger">
+			<strong>SSH CA not initialized.</strong> SSHPOP will not function.<br>
+			The CA must be re-initialized with <em>Enable SSH Certificate Authority</em> checked.
+			SSH CA keys (<code>ssh_user_ca_key</code>, <code>ssh_host_ca_key</code>) are generated
+			by <code>step ca init --ssh</code> and cannot be added after the fact.
+		</div>
+		<% else %>
+		<div class="alert alert-info">
+			<strong>SSH CA detected.</strong> SSHPOP is available.
+		</div>
+		<% end %>
+		<p><strong>SSHPOP (SSH Proof of Possession)</strong> allows users to exchange an SSH certificate for an X.509 certificate.</p>
+		<p><strong>Prerequisites:</strong></p>
+		<ol>
+			<li>CA initialized with SSH support (<code>step ca init --ssh</code>)</li>
+			<li>User has an SSH <em>certificate</em> (not just a key) signed by the step-ca SSH user CA:<br>
+				<code>step ssh certificate user@example.com ~/.ssh/id_ed25519.pub</code></li>
+		</ol>
+		<p><strong>Client certificate request:</strong></p>
+		<pre>step ca certificate &lt;cn&gt; cert.crt cert.key \
+  --provisioner &lt;sshpop-name&gt; \
+  --ssh-pop-cert ~/.ssh/id_ed25519-cert.pub \
+  --ssh-pop-key ~/.ssh/id_ed25519</pre>
 	</fieldset>
 
 	<div class="form-group" style="margin-top: 30px;">
 		<button type="submit" class="btn btn-primary">
 			<i class="icon-ok"></i> Add Provisioner
 		</button>
-		<button type="button" class="btn btn-default" onclick="window.location.href='<%= html.html_escape(page_info.script .. page_info.prefix .. page_info.controller .. "/templates") %>'">
+		<button type="button" class="btn btn-default" onclick="window.location.href='<%= html.html_escape(page_info.script .. page_info.prefix .. page_info.controller .. "/provisioners") %>'">
 			<i class="icon-remove"></i> Cancel
 		</button>
 	</div>

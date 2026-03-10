@@ -59,6 +59,20 @@ function mymodule.saveprovisionerclaims(self)
 end
 
 -- ===========================================================================
+-- SSH Certificate Signing
+-- ===========================================================================
+
+-- SSH certificate signing form
+function mymodule.sshsign(self)
+    return self.model.get_ssh_sign_form(self.clientdata)
+end
+
+-- Process SSH certificate signing
+function mymodule.dosshsign(self)
+    return self.model.sign_ssh_cert(self.clientdata)
+end
+
+-- ===========================================================================
 -- Certificate Management Actions
 -- ===========================================================================
 
@@ -66,6 +80,7 @@ end
 function mymodule.listcerts(self)
     return self.model.list_certificates(self.clientdata)
 end
+
 
 -- List certificates with expiration tracking
 function mymodule.certexpiration(self)
@@ -244,7 +259,12 @@ function mymodule.saveconfig(self)
     return self.model.save_config(self.clientdata)
 end
 
--- Restart step-ca service
+-- Start/stop/restart step-ca service (ACF standard pattern)
+function mymodule.startstop(self)
+    return self.handle_form(self, self.model.get_startstop, self.model.startstop_service, self.clientdata)
+end
+
+-- Restart step-ca service (used by config/provisioner pages)
 function mymodule.restart(self)
     self.model.restart_service()
     self.conf.action = "status"

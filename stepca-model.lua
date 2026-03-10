@@ -7,6 +7,7 @@ local posix = require("posix")
 local format = require("acf.format")
 local fs = require("acf.fs")
 local processinfo = require("acf.processinfo")
+local modelfunctions = require("modelfunctions")
 
 -- ============================================================================
 -- Basic Helper Functions (must be first)
@@ -24,6 +25,12 @@ end
 -- Helper to check if jq is installed
 local function has_jq()
     local res = exec_command("which jq 2>/dev/null")
+    return res ~= ""
+end
+
+-- Helper to check if step-badger is installed
+local function has_step_badger()
+    local res = exec_command("which step-badger 2>/dev/null")
     return res ~= ""
 end
 
@@ -268,16 +275,11 @@ local function get_cert_metadata(cert_path)
     local text_output = exec_command(text_cmd)
 
     local meta = {}
-    -- Extract hex serial from "Serial Number: <decimal> (0x<hex>)"
-    local hex_serial = text_output:match("Serial Number:.-%(0x(%x+)%)")
-    if not hex_serial then
-        -- Fallback for different output versions
-        hex_serial = text_output:match("Serial Number:%s+(%x+)")
-    end
-
-    if hex_serial then
-        meta.serial = hex_serial:upper():gsub("^0+", "")
-        if meta.serial == "" then meta.serial = "0" end
+    -- Extract decimal serial from "Serial Number: <decimal> (0x<hex>)"
+    -- step ca revoke and step ca token both require decimal to match the JWT subject.
+    local dec_serial = text_output:match("Serial Number:%s+(%d+)%s+%(")
+    if dec_serial and dec_serial ~= "" then
+        meta.serial = dec_serial
     end
 
     -- Now get the rest from JSON for accuracy
@@ -289,13 +291,12 @@ local function get_cert_metadata(cert_path)
         local sub_filter = ".subject.common_name[0] // .subject[0] // .subject_dn"
         meta.subject = exec_command(string.format(jq_cmd, json_output:gsub("'", "'\\''"), sub_filter)):gsub("%s+", "")
 
-        -- Only use JSON serial if text extraction failed (will be decimal)
+        -- Fallback: get decimal serial from JSON .serial_number if text extraction failed
         if not meta.serial then
             local ser_filter = ".serial_number"
             local escaped = json_output:gsub("'", "'\\''")
-            local raw_serial = exec_command(string.format(jq_cmd, escaped, ser_filter)):gsub("%s+", ""):upper()
-            meta.serial = raw_serial:gsub("^0+", "")
-            if meta.serial == "" then meta.serial = "0" end
+            meta.serial = exec_command(string.format(jq_cmd, escaped, ser_filter)):gsub("%s+", "")
+            if meta.serial == "" then meta.serial = nil end
         end
 
         local escaped_out = json_output:gsub("'", "'\\''")
@@ -481,6 +482,37 @@ local function is_infrastructure_cert(cert_type)
     end
 
     return infra[cert_type] == true
+end
+
+-- Determine whether an expired certificate should be shown given the user's
+-- chosen expired_window sub-filter and the cert's own properties.
+-- finish_epoch : unix timestamp of cert NotAfter (nil = unknown, treat as not expired)
+-- total_lifetime_days : cert lifetime in days (nil = unknown)
+-- is_infra : bool — infrastructure cert (Root CA, Intermediate CA, Server, etc.)
+-- expired_window : "smart" | "24h" | "1w" | "all"
+local function show_expired(finish_epoch, total_lifetime_days, is_infra, expired_window)
+    local now = os.time()
+    -- Not expired at all — always show
+    if not finish_epoch or finish_epoch > now then return true end
+
+    local expired_secs = now - finish_epoch  -- seconds since expiry
+
+    if expired_window == "all" then
+        return true
+    elseif expired_window == "1w" then
+        return expired_secs <= (7 * 86400)
+    elseif expired_window == "24h" then
+        return expired_secs <= 86400
+    else -- "smart" (default)
+        -- Infrastructure: always show regardless of age
+        if is_infra then return true end
+        -- Longer-lived ephemeral (>48h total lifetime): hide after 1 week
+        if total_lifetime_days and total_lifetime_days > 2 then
+            return expired_secs <= (7 * 86400)
+        end
+        -- Short-lived ephemeral (≤48h lifetime): hide after 24h
+        return expired_secs <= 86400
+    end
 end
 
 -- Helper function to read thresholds from config file
@@ -702,14 +734,17 @@ function mymodule.get_status()
 end
 
 -- Restart the step-ca service
+function mymodule.get_startstop(self, clientdata)
+    return modelfunctions.get_startstop(servicename)
+end
+
+function mymodule.startstop_service(self, startstop, action)
+    return modelfunctions.startstop_service(startstop, action)
+end
+
 function mymodule.restart_service()
-    -- Use rc-service directly as processinfo.service_action is not available
-    -- We try 'reload' first, then 'restart' if reload is not supported
-    local output = exec_command("rc-service " .. servicename .. " reload 2>&1")
-    if output:lower():match("unrecognized") or output:lower():match("not found") then
-        output = exec_command("rc-service " .. servicename .. " restart 2>&1")
-    end
-    return output
+    local output, errtxt = processinfo.daemoncontrol(servicename, "restart")
+    return output or errtxt or ""
 end
 
 -- Helper function to query BadgerDB for all certificates in bulk
@@ -786,10 +821,19 @@ local function load_bulk_certificate_data()
     return bulk_data, (found_data and exec_time or nil)
 end
 
--- List all certificates
+-- Forward declaration: defined later after the helper functions it uses.
+local list_certs_from_badger
+
+-- List all certificates.
+-- Uses step-badger (fast, rich metadata) when available; falls back to file parsing.
 function mymodule.list_certificates(clientdata)
+    if has_step_badger() then
+        return list_certs_from_badger(clientdata)
+    end
+
     clientdata = clientdata or {}
-    local filter = clientdata.filter or "all"
+    local filter         = clientdata.filter         or "all"
+    local expired_window = clientdata.expired_window or "smart"
     local certs = {}
 
     -- Load bulk data from DB first (fast)
@@ -859,25 +903,32 @@ function mymodule.list_certificates(clientdata)
                     ),
                     expiration_date = create_cfe("expiration_date", not_after, "Expiration", "Expiration date", "text"),
                     status = create_cfe("status", calc_status, "Status", "Expiration/Revocation status", "text"),
-                    color = create_cfe("color", color, "Status Color", "Status indicator color", "text")
+                    color = create_cfe("color", color, "Status Color", "Status indicator color", "text"),
+                    -- Raw values used by the expired-window sub-filter (not rendered by the view)
+                    _finish_epoch    = exp_epoch,
+                    _lifetime_days   = total_lifetime_days,
                 })
             end
         end
     end
 
-    -- Apply filter
+    -- Apply type + expired-window filters
     local visible = {}
     for _, cert in ipairs(certs) do
-        local cert_type = cert.cert_type.value
-        if filter == "infrastructure" then
-            if is_infrastructure_cert(cert_type) then
-                table.insert(visible, cert)
-            end
-        elseif filter == "ephemeral" then
-            if not is_infrastructure_cert(cert_type) then
-                table.insert(visible, cert)
-            end
-        else
+        local cert_type  = cert.cert_type.value
+        local is_infra   = is_infrastructure_cert(cert_type)
+
+        -- Type filter
+        local type_ok
+        if filter == "infrastructure" then     type_ok = is_infra
+        elseif filter == "ephemeral" then      type_ok = not is_infra
+        else                                   type_ok = true
+        end
+
+        -- Expired-window sub-filter (uses raw epoch/lifetime stored during build)
+        local window_ok = show_expired(cert._finish_epoch, cert._lifetime_days, is_infra, expired_window)
+
+        if type_ok and window_ok then
             table.insert(visible, cert)
         end
     end
@@ -889,12 +940,255 @@ function mymodule.list_certificates(clientdata)
             "filter", filter, "Filter", "Certificate filter", "select",
             {"all", "infrastructure", "ephemeral"}
         ),
+        expired_window = create_cfe(
+            "expired_window", expired_window, "Show expired", "How far back to show expired certs", "select",
+            {"smart", "24h", "1w", "all"}
+        ),
         db_exec_time = create_cfe(
             "db_exec_time", db_exec_time and string.format("%.4f", db_exec_time) or "",
             "DB Load Time", "Execution time of bulk loader", "text"
         )
     }
 end
+
+-- Private: query BadgerDB via step-badger and return the exact same structure as
+-- list_certs_from_files so both paths are interchangeable.
+list_certs_from_badger = function(clientdata)
+    clientdata = clientdata or {}
+    local filter         = clientdata.filter         or "all"
+    local expired_window = clientdata.expired_window or "smart"
+
+    local function empty_result(err_msg)
+        return {
+            error = err_msg and create_cfe("error", err_msg, "Error", "", "text") or nil,
+            certificates = {},
+            count        = create_cfe("count",  "0",    "Certificates",      "Number of certificates", "text"),
+            filter       = create_cfe("filter", filter, "Filter",            "Certificate filter",     "select",
+                {"all", "infrastructure", "ephemeral"}),
+            db_exec_time = create_cfe("db_exec_time", "", "DB Load Time", "", "text"),
+        }
+    end
+
+    if not file_exists(step_db_path) then
+        return empty_result("Database not found at " .. step_db_path)
+    end
+    if not has_jq() then
+        return empty_result("jq is required (not found in PATH)")
+    end
+
+    -- Slim the large JSON output to only the fields we need.
+    -- jq -c '.[] | {...}' → one flat JSON object per line.
+    local jq_filter = '.[] | {'
+        .. '"cn":.Certificate.Subject.CommonName,'
+        .. '"issuer":.Certificate.Issuer.CommonName,'
+        .. '"not_before":.Certificate.NotBefore,'
+        .. '"not_after":.Certificate.NotAfter,'
+        .. '"validity":.Validity,'
+        .. '"serial":.StringSerials.SerialDec,'
+        .. '"is_ca":(.Certificate.IsCA | tostring),'
+        .. '"eku":(.Certificate.ExtKeyUsage // [] | map(tostring) | join(","))'
+        .. '}'
+
+    local t0 = os.time()
+    local full_cmd = string.format(
+        "T=$(mktemp -d /tmp/step-badger.XXXXXX) && cp -r '%s'/* \"$T\"/ 2>/dev/null;"
+        .. " export PATH='/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin';"
+        .. " step-badger x509Certs \"$T\" -re --serial hex --emit json 2>/dev/null"
+        .. " | jq -c '%s';"
+        .. " rm -rf \"$T\"",
+        step_db_path,
+        jq_filter
+    )
+    local raw_output = exec_command(full_cmd)
+    local exec_time  = os.time() - t0
+
+    -- Extract a quoted string value from a compact JSON object line
+    local function js(obj, key)
+        return obj:match('"' .. key .. '":"([^"]*)"') or ""
+    end
+
+    -- Pass 1: parse all records and find the root CA CN (self-signed CA)
+    local records  = {}
+    local root_cn  = nil
+    for line in raw_output:gmatch("[^\n]+") do
+        if line:sub(1, 1) == "{" then
+            local rec = {
+                cn         = js(line, "cn"),
+                issuer     = js(line, "issuer"),
+                not_before = js(line, "not_before"),
+                not_after  = js(line, "not_after"),
+                validity   = js(line, "validity"),
+                serial     = js(line, "serial"),
+                is_ca      = (js(line, "is_ca") == "true"),
+                eku        = js(line, "eku"),
+            }
+            if rec.cn ~= "" or rec.not_after ~= "" then
+                table.insert(records, rec)
+                if rec.is_ca and rec.cn == rec.issuer then
+                    root_cn = rec.cn
+                end
+            end
+        end
+    end
+
+    -- Pass 2: classify, compute status, apply filter
+    local now   = os.time()
+    local certs = {}
+
+    for _, rec in ipairs(records) do
+        -- Determine cert type matching detect_cert_type() labels exactly
+        local cert_type, is_system
+        if rec.is_ca then
+            if rec.cn == rec.issuer then
+                cert_type = "Root CA";         is_system = true
+            elseif root_cn and rec.issuer == root_cn then
+                cert_type = "Intermediate CA"; is_system = true
+            else
+                cert_type = "CA";              is_system = false
+            end
+        else
+            local e = "," .. rec.eku .. ","
+            local srv = e:find(",1,") ~= nil
+            local clt = e:find(",2,") ~= nil
+            if srv and clt then      cert_type = "Client-Server"
+            elseif srv then          cert_type = "Server"
+            elseif clt then          cert_type = "Client"
+            else                     cert_type = "User Certificate"
+            end
+            is_system = false
+        end
+
+        -- Derive the filesystem cert_name used in action links
+        local cert_name
+        if cert_type == "Root CA" then
+            cert_name = "root_ca"
+        elseif cert_type == "Intermediate CA" then
+            cert_name = "intermediate_ca"
+        else
+            cert_name = rec.cn
+        end
+
+        -- Compute days remaining and lifetime
+        local start_epoch  = parse_date_to_epoch(rec.not_before)
+        local finish_epoch = parse_date_to_epoch(rec.not_after)
+        local days_remaining, total_lifetime_days
+        if finish_epoch then
+            days_remaining     = math.floor((finish_epoch - now) / 86400)
+            if start_epoch then
+                total_lifetime_days = math.floor((finish_epoch - start_epoch) / 86400)
+            end
+        end
+
+        -- Status and color using the same logic as the file-based path
+        local calc_status, color
+        if rec.validity == "Revoked" then
+            calc_status = "Revoked"; color = "red"
+        else
+            calc_status, color = get_expiration_status(days_remaining, cert_type, total_lifetime_days)
+        end
+
+        -- Apply filter.
+        -- For CA certs always treat as infrastructure.
+        -- For leaf certs use lifetime: > 29 days = infrastructure, else ephemeral.
+        -- This lets short-lived Client-Server certs appear under the ephemeral filter.
+        local is_infra
+        if cert_type == "Root CA" or cert_type == "Intermediate CA" or cert_type == "CA" then
+            is_infra = true
+        elseif total_lifetime_days then
+            is_infra = total_lifetime_days > 29
+        else
+            is_infra = is_infrastructure_cert(cert_type)
+        end
+
+        -- Type filter
+        local type_ok
+        if filter == "infrastructure" then     type_ok = is_infra
+        elseif filter == "ephemeral" then      type_ok = not is_infra
+        else                                   type_ok = true
+        end
+
+        -- Expired-window sub-filter
+        local window_ok = show_expired(finish_epoch, total_lifetime_days, is_infra, expired_window)
+
+        if type_ok and window_ok then
+            local cert_path = step_certs_path .. "/" .. cert_name .. ".crt"
+            table.insert(certs, {
+                name = create_cfe("name", cert_name, "Certificate Name", "Certificate filename", "text"),
+                subject = create_cfe("subject", rec.cn, "Common Name", "Certificate CN", "text"),
+                serial = create_cfe("serial", rec.serial, "Serial Number", "Certificate serial number", "text"),
+                cert_type = create_cfe("cert_type", cert_type, "Type", "Certificate type", "text"),
+                is_system_cert = create_cfe("is_system_cert", tostring(is_system), "System Cert", "Managed", "text"),
+                is_revoked = create_cfe("is_revoked",
+                    tostring(rec.validity == "Revoked"), "Revoked", "Is revoked", "boolean"),
+                path = create_cfe("path", cert_path, "File Path", "Path to file", "text"),
+                days_remaining = create_cfe("days_remaining",
+                    tostring(days_remaining or "N/A"), "Days Left", "Days left", "text"),
+                expiration_date = create_cfe("expiration_date", rec.not_after, "Expiration", "Expiration date", "text"),
+                status = create_cfe("status", calc_status, "Status", "Expiration/Revocation status", "text"),
+                color = create_cfe("color", color, "Status Color", "Status indicator color", "text"),
+            })
+        end
+    end
+
+    -- Supplement with system CA certs (root_ca, intermediate_ca).
+    -- These are created offline during CA init and are never written to BadgerDB.
+    for _, sys_name in ipairs({"root_ca", "intermediate_ca"}) do
+        local cert_file = step_certs_path .. "/" .. sys_name .. ".crt"
+        if file_exists(cert_file) then
+            local meta = get_cert_metadata(cert_file)
+            if meta then
+                local cert_type, is_system = detect_cert_type(cert_file, sys_name)
+                local start_epoch  = parse_date_to_epoch(meta.not_before)
+                local finish_epoch = parse_date_to_epoch(meta.not_after)
+                local days_num, lifetime_days
+                if finish_epoch then
+                    days_num = math.floor((finish_epoch - now) / 86400)
+                    if start_epoch then
+                        lifetime_days = math.floor((finish_epoch - start_epoch) / 86400)
+                    end
+                end
+                local calc_status, color = get_expiration_status(days_num, cert_type, lifetime_days)
+
+                -- CA certs are always infrastructure; apply both type and window filters
+                local type_ok  = (filter == "all") or (filter == "infrastructure")
+                local window_ok = show_expired(finish_epoch, lifetime_days, true, expired_window)
+                local include = type_ok and window_ok
+                if include then
+                    table.insert(certs, {
+                        name = create_cfe("name", sys_name, "Certificate Name", "Certificate filename", "text"),
+                        subject = create_cfe("subject",
+                            meta.subject or sys_name, "Common Name", "Certificate CN", "text"),
+                        serial = create_cfe("serial",
+                            meta.serial or "", "Serial Number", "Certificate serial number", "text"),
+                        cert_type = create_cfe("cert_type", cert_type, "Type", "Certificate type", "text"),
+                        is_system_cert = create_cfe("is_system_cert", "true", "System Cert", "Managed", "text"),
+                        is_revoked = create_cfe("is_revoked", "false", "Revoked", "Is revoked", "boolean"),
+                        path = create_cfe("path", cert_file, "File Path", "Path to file", "text"),
+                        days_remaining = create_cfe("days_remaining",
+                            tostring(days_num or "N/A"), "Days Left", "Days left", "text"),
+                        expiration_date = create_cfe("expiration_date",
+                            meta.not_after or "", "Expiration", "Expiration date", "text"),
+                        status = create_cfe("status", calc_status, "Status", "Expiration/Revocation status", "text"),
+                        color = create_cfe("color", color, "Status Color", "Status indicator color", "text"),
+                    })
+                end
+            end
+        end
+    end
+
+    return {
+        certificates = certs,
+        count = create_cfe("count", tostring(#certs), "Certificates", "Number of certificates", "text"),
+        filter = create_cfe("filter", filter, "Filter", "Certificate filter", "select",
+            {"all", "infrastructure", "ephemeral"}),
+        expired_window = create_cfe("expired_window", expired_window,
+            "Show expired", "How far back to show expired certs", "select",
+            {"smart", "24h", "1w", "all"}),
+        db_exec_time = create_cfe("db_exec_time",
+            string.format("%.1f", exec_time), "DB Load Time", "Execution time of bulk loader", "text"),
+    }
+end
+
 
 -- Get certificate details
 function mymodule.get_certificate_details(clientdata)
@@ -1656,6 +1950,9 @@ function mymodule.list_provisioners()
         elseif prov.type == "ACME" then
             description = "Automated Certificate Management Environment"
             icon = "🤖"
+        elseif prov.type == "SCEP" then
+            description = "Simple Certificate Enrollment Protocol - for network devices"
+            icon = "📡"
         elseif prov.type == "SSHPOP" then
             description = "SSH Proof of Possession - X.509 certs from SSH keys"
             icon = "🔐"
@@ -1792,6 +2089,16 @@ function mymodule.get_add_provisioner_form(clientdata)
         ssh_templates
     )
 
+    -- Indicate whether SSH CA keys exist (required for SSHPOP provisioner)
+    local has_ssh = file_exists(step_ca_base .. "/certs/ssh_user_ca_key.pub")
+    form.has_ssh = create_cfe(
+        "has_ssh",
+        tostring(has_ssh),
+        "SSH CA Available",
+        "Whether the CA was initialized with SSH support (required for SSHPOP)",
+        "text"
+    )
+
     return form
 end
 
@@ -1819,6 +2126,26 @@ function mymodule.add_provisioner(clientdata)
             result.error = create_cfe("error", "Client ID is required for OIDC provisioner", "Error", "", "text")
             return result
         end
+        if config_endpoint == "" then
+            result.error = create_cfe("error",
+                "Configuration Endpoint is required for OIDC provisioner", "Error", "", "text")
+            return result
+        end
+    end
+
+    -- Validation: SSHPOP requires SSH CA keys (only exist when CA was inited with --ssh)
+    if clientdata.prov_type == "SSHPOP" then
+        local ssh_user_ca_pub = step_ca_base .. "/certs/ssh_user_ca_key.pub"
+        if not file_exists(ssh_user_ca_pub) then
+            result.error = create_cfe(
+                "error",
+                "SSHPOP requires SSH CA support, but no SSH CA keys were found.\n\n"
+                .. "The CA must be re-initialized with 'Enable SSH Certificate Authority' checked.\n"
+                .. "SSH CA keys are created by step ca init --ssh and cannot be added after the fact.",
+                "Error", "", "text"
+            )
+            return result
+        end
     end
 
     -- 1. Setup Password and Keys based on type
@@ -1843,8 +2170,15 @@ function mymodule.add_provisioner(clientdata)
         args = args .. string.format("--type JWK --create --password-file='%s' ", pass_path)
 
     elseif clientdata.prov_type == "OIDC" then
-        args = args .. string.format("--type OIDC --client-id '%s' --client-secret '%s' --configuration-endpoint '%s' ",
-            client_id, client_secret, config_endpoint)
+        local listen_address = (clientdata.listen_address or ""):gsub("^%s*(.-)%s*$", "%1")
+        args = args .. string.format("--type OIDC --client-id '%s' --configuration-endpoint '%s' ",
+            client_id, config_endpoint)
+        if client_secret ~= "" then
+            args = args .. string.format("--client-secret '%s' ", client_secret:gsub("'", "'\\''"))
+        end
+        if listen_address ~= "" then
+            args = args .. string.format("--listen-address '%s' ", listen_address)
+        end
 
     elseif clientdata.prov_type == "ACME" then
         args = args .. "--type ACME "
@@ -2461,18 +2795,18 @@ function mymodule.get_setup_form(clientdata)
 
     form.enable_ssh = create_cfe(
         "enable_ssh",
-        clientdata.enable_ssh or "false",
+        false,
         "Enable SSH Certificate Authority",
         "Generate SSH CA keys so this CA can sign SSH host and user certificates",
-        "checkbox"
+        "boolean"
     )
 
     form.gen_intermediate = create_cfe(
         "gen_intermediate",
-        clientdata.gen_intermediate or "true",
+        true,
         "Generate Intermediate CA",
         "Create an intermediate CA (recommended for security)",
-        "checkbox"
+        "boolean"
     )
 
     form.intermediate_validity_years = create_cfe(
@@ -2480,14 +2814,6 @@ function mymodule.get_setup_form(clientdata)
         clientdata.intermediate_validity_years or "5",
         "Intermediate CA Validity (Years)",
         "How long the intermediate CA is valid (typically half of root CA)",
-        "text"
-    )
-
-    form.server_cert_validity_days = create_cfe(
-        "server_cert_validity_days",
-        clientdata.server_cert_validity_days or "365",
-        "Server Certificate Validity (Days)",
-        "Default validity period for server certificates",
         "text"
     )
 
@@ -2529,10 +2855,9 @@ function mymodule.initialize_ca(clientdata)
     local ca_provisioner = clientdata.ca_provisioner or "admin"
     local ca_port = clientdata.ca_port or default_port
     local ca_validity_years = tonumber(clientdata.ca_validity_years) or 10
-    local enable_ssh = (clientdata.enable_ssh == "true" or clientdata.enable_ssh == "on")
-    local gen_intermediate = (clientdata.gen_intermediate == "true" or clientdata.gen_intermediate == "on")
+    local enable_ssh = clientdata.enable_ssh == "true"
+    local gen_intermediate = clientdata.gen_intermediate == "true"
     local intermediate_validity_years = tonumber(clientdata.intermediate_validity_years) or 5
-    local server_cert_validity_days = tonumber(clientdata.server_cert_validity_days) or 365
 
     -- Validate required fields
     if ca_common_name == "" then
@@ -2630,31 +2955,6 @@ function mymodule.initialize_ca(clientdata)
         exec_as_stepca(intermediate_cmd)
         exec_command(string.format("chmod 600 %s/secrets/intermediate_ca_key", step_ca_base))
     end
-
-    -- Generate initial server certificates for internal use
-    local hostname = exec_command("hostname"):gsub("%s+", "")
-    local sans = string.format("%s,%s,localhost,127.0.0.1", ca_common_name, hostname)
-    local validity_h = server_cert_validity_days * 24
-
-    -- KMIP Server certificate
-    local server_cert_cmd = string.format(
-        "STEPPATH='%s' step ca certificate '%s'"
-        .. " %s/certs/server.crt %s/certs/server.key"
-        .. " --san '%s' --not-after=%dh --offline --no-password --insecure 2>&1",
-        step_ca_base, ca_common_name, step_ca_base, step_ca_base, sans, validity_h
-    )
-    exec_as_stepca(server_cert_cmd)
-    exec_command(string.format("chmod 600 %s/certs/server.key", step_ca_base))
-
-    -- Web UI certificate
-    local webui_cert_cmd = string.format(
-        "STEPPATH='%s' step ca certificate 'webui.%s'"
-        .. " %s/certs/webui.crt %s/certs/webui.key"
-        .. " --san 'webui.%s,%s' --not-after=%dh --offline --no-password --insecure 2>&1",
-        step_ca_base, ca_common_name, step_ca_base, step_ca_base, ca_common_name, sans, validity_h
-    )
-    exec_as_stepca(webui_cert_cmd)
-    exec_command(string.format("chmod 600 %s/certs/webui.key", step_ca_base))
 
     -- Final ownership fix
     exec_command(string.format("chown -R %s:%s %s", stepca_user, stepca_user, step_ca_base))
@@ -3239,6 +3539,194 @@ function mymodule.save_provisioner_claims(clientdata)
     result.x509_min.value = clientdata.x509_min
     result.x509_max.value = clientdata.x509_max
     result.x509_def.value = clientdata.x509_def
+
+    return result
+end
+
+-- ===========================================================================
+-- SSH Certificate Signing
+-- ===========================================================================
+
+-- Get SSH certificate signing form
+function mymodule.get_ssh_sign_form(clientdata)
+    clientdata = clientdata or {}
+    local form = {}
+
+    local has_ssh = file_exists(step_ca_base .. "/certs/ssh_user_ca_key.pub")
+    form.has_ssh = create_cfe(
+        "has_ssh", tostring(has_ssh), "SSH CA Available",
+        "Whether the CA was initialized with SSH support (required for SSH certificate signing)", "text"
+    )
+
+    form.ssh_pub_key = create_cfe(
+        "ssh_pub_key", clientdata.ssh_pub_key or "",
+        "SSH Public Key",
+        "Paste the contents of the user's ~/.ssh/id_ed25519.pub, id_rsa.pub, etc.",
+        "longtext"
+    )
+
+    form.identity = create_cfe(
+        "identity", clientdata.identity or "",
+        "Certificate Identity",
+        "Identity stored in the certificate (e.g. alice@company.com or alice@hostname)",
+        "text"
+    )
+
+    form.principals = create_cfe(
+        "principals", clientdata.principals or "",
+        "Principals (Unix usernames)",
+        "Comma-separated list of usernames this certificate authorizes (e.g. alice,root)",
+        "text"
+    )
+
+    form.validity = create_cfe(
+        "validity", clientdata.validity or "24h",
+        "Validity",
+        "How long the certificate is valid — use s, m, h, or d (e.g. 24h, 7d, 365d)",
+        "text"
+    )
+
+    form.cert_type = create_cfe(
+        "cert_type", clientdata.cert_type or "user",
+        "Certificate Type",
+        "User certificates authenticate users to SSH servers. Host certificates authenticate servers to users.",
+        "select", {"user", "host"}
+    )
+
+    return form
+end
+
+-- Sign an SSH public key using the step-ca SSH user or host CA key
+function mymodule.sign_ssh_cert(clientdata)
+    local result = {}
+    clientdata = clientdata or {}
+
+    -- Guard: SSH CA must be initialized
+    if not file_exists(step_ca_base .. "/certs/ssh_user_ca_key.pub") then
+        result.error = create_cfe(
+            "error",
+            "SSH CA not initialized. Re-initialize the CA with 'Enable SSH Certificate Authority' checked.",
+            "Error", "", "text"
+        )
+        return result
+    end
+
+    -- Clean and validate inputs
+    local ssh_pub_key = (clientdata.ssh_pub_key or ""):gsub("^%s*(.-)%s*$", "%1")
+    local identity    = (clientdata.identity    or ""):gsub("^%s*(.-)%s*$", "%1")
+    local principals  = (clientdata.principals  or ""):gsub("^%s*(.-)%s*$", "%1")
+    local validity    = (clientdata.validity    or "24h"):gsub("^%s*(.-)%s*$", "%1")
+    local cert_type   = clientdata.cert_type or "user"
+
+    if ssh_pub_key == "" then
+        result.error = create_cfe("error", "SSH public key is required", "Error", "", "text")
+        return result
+    end
+    if identity == "" then
+        result.error = create_cfe("error", "Certificate identity is required", "Error", "", "text")
+        return result
+    end
+    if principals == "" then
+        result.error = create_cfe("error", "At least one principal is required", "Error", "", "text")
+        return result
+    end
+
+    -- Basic key format check
+    if not ssh_pub_key:match("^ssh%-") and not ssh_pub_key:match("^ecdsa%-sha2") then
+        result.error = create_cfe(
+            "error",
+            "Invalid SSH public key. Must start with ssh-ed25519, ssh-rsa, ecdsa-sha2-nistp256, etc.",
+            "Error", "", "text"
+        )
+        return result
+    end
+
+    -- Validate and normalize validity duration
+    local validity_norm = normalize_duration(validity)
+    if not validity_norm then
+        result.error = create_cfe(
+            "error",
+            "Invalid validity format. Use a number followed by s, m, h, or d (e.g. 24h, 7d).",
+            "Error", "", "text"
+        )
+        return result
+    end
+
+    -- Write public key to a temp file
+    local tmp_dir = exec_command("mktemp -d /tmp/step-ssh-XXXXXX 2>/dev/null"):gsub("%s+", "")
+    if tmp_dir == "" then
+        result.error = create_cfe("error", "Failed to create temporary directory", "Error", "", "text")
+        return result
+    end
+
+    local tmp_pub  = tmp_dir .. "/key.pub"
+    local tmp_cert = tmp_dir .. "/key-cert.pub"
+
+    local fh = io.open(tmp_pub, "w")
+    if not fh then
+        exec_command("rm -rf '" .. tmp_dir .. "'")
+        result.error = create_cfe("error", "Failed to write temporary key file", "Error", "", "text")
+        return result
+    end
+    fh:write(ssh_pub_key .. "\n")
+    fh:close()
+
+    -- Build --principal flags (one per principal)
+    local principal_flags = {}
+    for p in principals:gmatch("[^,]+") do
+        local trimmed = p:match("^%s*(.-)%s*$")
+        if trimmed ~= "" then
+            table.insert(principal_flags, string.format("--principal '%s'", trimmed:gsub("'", "'\\''")))
+        end
+    end
+
+    local host_flag = (cert_type == "host") and " --host" or ""
+
+    local sign_cmd = string.format(
+        "STEPPATH='%s' step ssh certificate"
+        .. " --offline"
+        .. " --password-file '%s'"
+        .. " --not-after '%s'"
+        .. " %s%s"
+        .. " '%s' '%s' 2>&1",
+        step_ca_base,
+        step_password_file,
+        validity_norm,
+        table.concat(principal_flags, " "),
+        host_flag,
+        identity:gsub("'", "'\\''"),
+        tmp_pub
+    )
+
+    local output = exec_as_stepca(sign_cmd)
+
+    -- Read the signed certificate
+    local cert_content = ""
+    local cf = io.open(tmp_cert, "r")
+    if cf then
+        cert_content = cf:read("*a")
+        cf:close()
+    end
+
+    exec_command("rm -rf '" .. tmp_dir .. "'")
+
+    if cert_content ~= "" then
+        local safe_id = identity:gsub("[^a-zA-Z0-9._@-]", "_")
+        result.success     = create_cfe("success",      "SSH certificate signed successfully.", "Success", "", "text")
+        result.cert_content= create_cfe("cert_content", cert_content:gsub("%s+$", ""),
+            "Signed SSH Certificate",
+            "Save this as ~/.ssh/" .. safe_id .. "-cert.pub on the user's machine",
+            "longtext")
+        result.filename    = create_cfe("filename",     safe_id .. "-cert.pub",  "Filename",   "", "text")
+        result.identity    = create_cfe("identity",     identity,                "Identity",   "", "text")
+        result.principals  = create_cfe("principals",   principals,              "Principals", "", "text")
+        result.validity    = create_cfe("validity",     validity_norm,           "Validity",   "", "text")
+        result.cert_type   = create_cfe("cert_type",    cert_type,               "Type",       "", "text")
+    else
+        local clean = output:gsub("\27%[[%d;]*m", ""):gsub("^%s+", ""):gsub("%s+$", "")
+        result.error = create_cfe("error", "SSH certificate signing failed:\n" .. clean, "Error", "", "text")
+        result.debug = create_cfe("debug", output, "Debug Output", "", "longtext")
+    end
 
     return result
 end

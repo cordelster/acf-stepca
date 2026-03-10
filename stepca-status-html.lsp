@@ -80,3 +80,7 @@
 	</div>
 </div>
 <% end %>
+
+<% if viewlibrary and viewlibrary.dispatch_component and viewlibrary.check_permission("startstop") then %>
+<% viewlibrary.dispatch_component("startstop") %>
+<% end %>
