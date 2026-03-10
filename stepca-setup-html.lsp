@@ -74,7 +74,11 @@
 		<% htmlviewfunctions.displayformitem(view.ca_provisioner) %>
 		<% htmlviewfunctions.displayformitem(view.gen_intermediate) %>
 		<% htmlviewfunctions.displayformitem(view.intermediate_validity_years) %>
-		<% htmlviewfunctions.displayformitem(view.server_cert_validity_days) %>
+	</fieldset>
+
+	<fieldset>
+		<legend>Optional Features</legend>
+		<% htmlviewfunctions.displayformitem(view.enable_ssh) %>
 	</fieldset>
 
 	<div class="form-group">

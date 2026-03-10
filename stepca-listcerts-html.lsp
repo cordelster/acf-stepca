@@ -4,16 +4,29 @@
 
 <h1>Certificates</h1>
 
-<form method="get" action="<%= html.html_escape(page_info.script .. page_info.prefix .. page_info.controller .. "/listcerts") %>" class="form-inline" style="margin-bottom: 15px;">
-	<div class="form-group">
-		<label for="filter">Show: </label>
-		<select name="filter" id="filter" class="form-control" onchange="this.form.submit()">
-			<% local current_filter = view.filter and view.filter.value or "all" %>
-			<% for _, opt in ipairs({"all", "infrastructure", "ephemeral"}) do %>
-			<option value="<%= opt %>"<%= current_filter == opt and " selected" or "" %>><%= opt:sub(1,1):upper() .. opt:sub(2) %></option>
-			<% end %>
-		</select>
-	</div>
+<form method="get" action="<%= html.html_escape(page_info.script .. page_info.prefix .. page_info.controller .. "/listcerts") %>" style="margin-bottom: 15px; white-space: nowrap;">
+	<label for="filter" style="display:inline; margin-right:4px;">Type:</label>
+	<select name="filter" id="filter" style="display:inline-block; width:auto; margin-right:15px;" onchange="this.form.submit()">
+		<% local current_filter = view.filter and view.filter.value or "all" %>
+		<% for _, opt in ipairs({"all", "infrastructure", "ephemeral"}) do %>
+		<option value="<%= opt %>"<%= current_filter == opt and " selected" or "" %>><%= opt:sub(1,1):upper() .. opt:sub(2) %></option>
+		<% end %>
+	</select>
+	<label for="expired_window" style="display:inline; margin-right:4px;">Expired:</label>
+	<select name="expired_window" id="expired_window" style="display:inline-block; width:auto;" onchange="this.form.submit()">
+		<%
+		local current_window = view.expired_window and view.expired_window.value or "smart"
+		local window_labels = {
+			smart     = "Smart (auto)",
+			["24h"]   = "Last 24 hours",
+			["1w"]    = "Last 7 days",
+			["all"]   = "All (troubleshooting)",
+		}
+		%>
+		<% for _, opt in ipairs({"smart", "24h", "1w", "all"}) do %>
+		<option value="<%= opt %>"<%= current_window == opt and " selected" or "" %>><%= window_labels[opt] %></option>
+		<% end %>
+	</select>
 </form>
 
 <div class="panel panel-default">
