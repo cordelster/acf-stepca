@@ -7,7 +7,7 @@
 <div class="alert alert-danger">
 	<h4><i class="icon-warning-sign"></i> Warning: Destructive Action</h4>
 	<p>Revoking a certificate is <strong>permanent and cannot be undone</strong>. The certificate will be added to the Certificate Revocation List (CRL) and will no longer be trusted.</p>
-	<p>Make sure you have the correct serial number before proceeding.</p>
+	<p>Review the certificate details below before proceeding.</p>
 </div>
 
 <% if view.success then %>
@@ -53,9 +53,11 @@
 		<h3 class="panel-title">Revocation Form</h3>
 	</div>
 	<div class="panel-body">
-		<% if view.cert_name and view.cert_name.value ~= "" then %>
+		<% if view.cert_cn then %>
 		<div class="alert alert-info">
-			<strong>Certificate:</strong> <%= html.html_escape(view.cert_name.value) %>
+			<strong>Common Name:</strong> <%= html.html_escape(view.cert_cn.value) %><br>
+			<% if view.cert_not_before then %><strong>Valid From:</strong> <%= html.html_escape(view.cert_not_before.value) %><br><% end %>
+			<% if view.cert_not_after then %><strong>Valid To:</strong> <%= html.html_escape(view.cert_not_after.value) %><% end %>
 		</div>
 		<% end %>
 

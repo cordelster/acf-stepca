@@ -269,8 +269,7 @@ end
 local function get_cert_metadata(cert_path)
     if not file_exists(cert_path) then return nil end
 
-    -- We need the serial in hex to match step-badger, but JSON gives decimal.
-    -- We'll get both by using two passes or parsing text.
+    -- Extract decimal serial; step ca revoke and step ca token both accept decimal.
     local text_cmd = string.format("step certificate inspect %s 2>/dev/null", cert_path)
     local text_output = exec_command(text_cmd)
 
@@ -517,13 +516,14 @@ end
 
 -- Helper function to read thresholds from config file
 local function get_thresholds_from_config()
+    -- ACME 1/3-lifetime model anchored defaults:
+    --   notice   = 33% (1/3 remaining — renewal window opens)
+    --   warning  = 16% (~halfway through renewal window)
+    --   critical =  8% (~last quarter before expiry)
     local thresholds = {
-        critical_days = 7,
-        warning_days = 30,
-        notice_days = 90,
-        critical_percent = 10,
-        warning_percent = 30,
-        notice_percent = 50
+        notice_percent   = 33,
+        warning_percent  = 16,
+        critical_percent = 8,
     }
 
     if file_exists(acf_config_file) then
@@ -531,18 +531,12 @@ local function get_thresholds_from_config()
         for line in conf_content:gmatch("[^\n]+") do
             local key, value = line:match("^([^=]+)=(.+)$")
             if key and value then
-                if key == "CRITICAL_DAYS" then
-                    thresholds.critical_days = tonumber(value) or 7
-                elseif key == "WARNING_DAYS" then
-                    thresholds.warning_days = tonumber(value) or 30
-                elseif key == "NOTICE_DAYS" then
-                    thresholds.notice_days = tonumber(value) or 90
-                elseif key == "CRITICAL_PERCENT" then
-                    thresholds.critical_percent = tonumber(value) or 10
+                if key == "CRITICAL_PERCENT" then
+                    thresholds.critical_percent = tonumber(value) or 8
                 elseif key == "WARNING_PERCENT" then
-                    thresholds.warning_percent = tonumber(value) or 30
+                    thresholds.warning_percent = tonumber(value) or 16
                 elseif key == "NOTICE_PERCENT" then
-                    thresholds.notice_percent = tonumber(value) or 50
+                    thresholds.notice_percent = tonumber(value) or 33
                 end
             end
         end
@@ -551,56 +545,68 @@ local function get_thresholds_from_config()
     return thresholds
 end
 
--- Helper function to get expiration status color/label
--- Now cert_type aware: uses percentage thresholds for ephemeral, days for infrastructure
-local function get_expiration_status(days, cert_type, total_lifetime_days)
+-- Format a seconds-remaining value as a compact human string.
+--   >= 2 days  : "Xd Yh"
+--   >= 1 hour  : "Xh Ym"
+--   >= 0       : "Xm"
+--   < 0        : "Expired"
+local function format_time_remaining(seconds)
+    if not seconds then return "N/A" end
+    if seconds < 0 then return "Expired" end
+    local total_minutes = math.floor(seconds / 60)
+    local total_hours   = math.floor(seconds / 3600)
+    local days          = math.floor(seconds / 86400)
+    if days >= 2 then
+        local hours = math.floor((seconds - days * 86400) / 3600)
+        return string.format("%dd %dh", days, hours)
+    elseif total_hours >= 1 then
+        local mins = math.floor((seconds - total_hours * 3600) / 60)
+        return string.format("%dh %dm", total_hours, mins)
+    else
+        return string.format("%dm", total_minutes)
+    end
+end
+
+-- Helper function to get expiration status color/label.
+-- Uses ACME 1/3-lifetime model: status is based on % of lifetime remaining.
+--
+-- remaining_ratio: optional float (0.0–1.0) computed from raw epoch seconds.
+--   Pass this to avoid floor precision loss for short-lived certs — e.g. a 24h cert
+--   that is 5 minutes old has days_remaining=0 (floored) but remaining_ratio≈0.997.
+--   When absent, falls back to days/total_lifetime_days.
+local function get_expiration_status(days, cert_type, total_lifetime_days, remaining_ratio)
     if not days then
         return "Unknown", "gray"
     elseif days < 0 then
         return "Expired", "red"
     end
 
-    -- Get thresholds from config file
     local thresholds = get_thresholds_from_config()
 
-    -- Determine if this is infrastructure or ephemeral
-    local is_infra = is_infrastructure_cert(cert_type or "User Certificate")
-
-    if is_infra then
-        -- Infrastructure: Use fixed day thresholds (configurable)
-        if days <= thresholds.critical_days then
-            return "Critical", "red"
-        elseif days <= thresholds.warning_days then
-            return "Warning", "yellow"
-        elseif days <= thresholds.notice_days then
-            return "Soon", "blue"
-        else
-            return "Valid", "green"
-        end
+    local remaining_percent
+    if remaining_ratio then
+        remaining_percent = remaining_ratio * 100
+    elseif total_lifetime_days and total_lifetime_days > 0 then
+        remaining_percent = (days / total_lifetime_days) * 100
     else
-        -- Ephemeral (WiFi, etc): Use percentage thresholds (configurable)
-        if not total_lifetime_days or total_lifetime_days == 0 then
-            -- Fallback to days if we can't calculate percentage
-            if days <= 1 then
-                return "Critical", "red"
-            elseif days <= 3 then
-                return "Warning", "yellow"
-            else
-                return "Valid", "green"
-            end
-        end
-
-        local remaining_percent = (days / total_lifetime_days) * 100
-
-        if remaining_percent <= thresholds.critical_percent then
+        -- Lifetime unknown: fall back to conservative fixed-day thresholds
+        if days <= 7 then
             return "Critical", "red"
-        elseif remaining_percent <= thresholds.warning_percent then
+        elseif days <= 30 then
             return "Warning", "yellow"
-        elseif remaining_percent <= thresholds.notice_percent then
-            return "Soon", "blue"
         else
             return "Valid", "green"
         end
+    end
+
+    if remaining_percent <= thresholds.critical_percent then
+        return "Critical", "red"
+    elseif remaining_percent <= thresholds.warning_percent then
+        return "Warning", "yellow"
+    elseif remaining_percent <= thresholds.notice_percent then
+        return "Soon", "blue"
+    else
+        return "Valid", "green"
     end
 end
 
@@ -760,7 +766,7 @@ local function load_bulk_certificate_data()
     local cmd = string.format(
         "T=$(mktemp -d /tmp/step-bulk.XXXXXX); cp -r '%s'/* $T/ 2>/dev/null; " ..
         "export PATH='/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'; " ..
-        "step-badger x509Certs $T -r --emit openssl --serial hex 2>/dev/null; " ..
+        "step-badger x509Certs $T -r --emit openssl 2>/dev/null; " ..
         "rm -rf $T",
         step_db_path
     )
@@ -793,16 +799,14 @@ local function load_bulk_certificate_data()
 
             if status_flag == "V" then
                 -- Valid: V, expiry, serial, subject...
-                serial = parts[3]:upper():gsub("^0X", ""):gsub("^0+", "")
-                if serial == "" then serial = "0" end
+                serial = parts[3]
                 meta.status = "Valid"
                 meta.not_after = parts[2]
                 -- Subject starts at 4th non-space block
                 meta.subject = line:match("%S+%s+%S+%s+%S+%s+(.*)") or "Unknown"
             elseif status_flag == "R" then
                 -- Revoked: R, expiry, revoke_date, serial, reason, subject...
-                serial = parts[4]:upper():gsub("^0X", ""):gsub("^0+", "")
-                if serial == "" then serial = "0" end
+                serial = parts[4]
                 meta.status = "Revoked"
                 meta.not_after = parts[2]
                 -- Subject starts at 6th non-space block
@@ -810,8 +814,6 @@ local function load_bulk_certificate_data()
             end
 
             if serial ~= "" then
-                -- Match step-cli behavior: serial might be padded
-                -- We'll store it normalized
                 bulk_data[serial] = meta
                 found_data = true
             end
@@ -871,14 +873,20 @@ function mymodule.list_certificates(clientdata)
                 local exp_epoch = parse_date_to_epoch(not_after)
                 local start_epoch = parse_date_to_epoch(not_before)
 
+                local remaining_ratio
                 if exp_epoch then
-                    days_remaining = math.floor((exp_epoch - os.time()) / 86400)
+                    local now_ts = os.time()
+                    days_remaining = math.floor((exp_epoch - now_ts) / 86400)
                     if start_epoch then
                         total_lifetime_days = math.floor((exp_epoch - start_epoch) / 86400)
+                        local lifetime_secs = exp_epoch - start_epoch
+                        if lifetime_secs > 0 then
+                            remaining_ratio = (exp_epoch - now_ts) / lifetime_secs
+                        end
                     end
                 end
 
-                local calc_status, color = get_expiration_status(days_remaining, cert_type, total_lifetime_days)
+                local calc_status, color = get_expiration_status(days_remaining, cert_type, total_lifetime_days, remaining_ratio)
 
                 -- Overwrite status if DB says it's revoked
                 if status == "Revoked" then
@@ -900,7 +908,9 @@ function mymodule.list_certificates(clientdata)
                     ),
                     path = create_cfe("path", cert_file, "File Path", "Path to file", "text"),
                     days_remaining = create_cfe(
-                        "days_remaining", tostring(days_remaining or "N/A"), "Days Left", "Days left", "text"
+                        "days_remaining",
+                        exp_epoch and format_time_remaining(exp_epoch - now_ts) or "N/A",
+                        "Remaining", "Time remaining", "text"
                     ),
                     expiration_date = create_cfe("expiration_date", not_after, "Expiration", "Expiration date", "text"),
                     status = create_cfe("status", calc_status, "Status", "Expiration/Revocation status", "text"),
@@ -998,7 +1008,7 @@ list_certs_from_badger = function(clientdata)
     local full_cmd = string.format(
         "T=$(mktemp -d /tmp/step-badger.XXXXXX) && cp -r '%s'/* \"$T\"/ 2>/dev/null;"
         .. " export PATH='/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin';"
-        .. " step-badger x509Certs \"$T\" -re --serial hex --emit json 2>/dev/null"
+        .. " step-badger x509Certs \"$T\" -re --emit json 2>/dev/null"
         .. " | jq -c '%s';"
         .. " rm -rf \"$T\"",
         step_db_path,
@@ -1076,11 +1086,15 @@ list_certs_from_badger = function(clientdata)
         -- Compute days remaining and lifetime
         local start_epoch  = parse_date_to_epoch(rec.not_before)
         local finish_epoch = parse_date_to_epoch(rec.not_after)
-        local days_remaining, total_lifetime_days
+        local days_remaining, total_lifetime_days, remaining_ratio
         if finish_epoch then
             days_remaining     = math.floor((finish_epoch - now) / 86400)
             if start_epoch then
                 total_lifetime_days = math.floor((finish_epoch - start_epoch) / 86400)
+                local lifetime_secs = finish_epoch - start_epoch
+                if lifetime_secs > 0 then
+                    remaining_ratio = (finish_epoch - now) / lifetime_secs
+                end
             end
         end
 
@@ -1089,7 +1103,7 @@ list_certs_from_badger = function(clientdata)
         if rec.validity == "Revoked" then
             calc_status = "Revoked"; color = "red"
         else
-            calc_status, color = get_expiration_status(days_remaining, cert_type, total_lifetime_days)
+            calc_status, color = get_expiration_status(days_remaining, cert_type, total_lifetime_days, remaining_ratio)
         end
 
         -- Apply filter.
@@ -1128,8 +1142,11 @@ list_certs_from_badger = function(clientdata)
                     tostring(rec.validity == "Revoked"), "Revoked", "Is revoked", "boolean"),
                 path = create_cfe("path", cert_path, "File Path", "Path to file", "text"),
                 days_remaining = create_cfe("days_remaining",
-                    tostring(days_remaining or "N/A"), "Days Left", "Days left", "text"),
+                    finish_epoch and format_time_remaining(finish_epoch - now) or "N/A",
+                    "Remaining", "Time remaining", "text"),
                 expiration_date = create_cfe("expiration_date", rec.not_after, "Expiration", "Expiration date", "text"),
+                not_before = create_cfe("not_before", rec.not_before, "Valid From", "Certificate valid from date", "text"),
+                _not_before_epoch = parse_date_to_epoch(rec.not_before) or 0,
                 status = create_cfe("status", calc_status, "Status", "Expiration/Revocation status", "text"),
                 color = create_cfe("color", color, "Status Color", "Status indicator color", "text"),
                 has_local_cert = create_cfe("has_local_cert", tostring(file_exists(cert_path)),
@@ -1150,14 +1167,18 @@ list_certs_from_badger = function(clientdata)
                 local cert_type, is_system = detect_cert_type(cert_file, sys_name)
                 local start_epoch  = parse_date_to_epoch(meta.not_before)
                 local finish_epoch = parse_date_to_epoch(meta.not_after)
-                local days_num, lifetime_days
+                local days_num, lifetime_days, remaining_ratio
                 if finish_epoch then
                     days_num = math.floor((finish_epoch - now) / 86400)
                     if start_epoch then
                         lifetime_days = math.floor((finish_epoch - start_epoch) / 86400)
+                        local lifetime_secs = finish_epoch - start_epoch
+                        if lifetime_secs > 0 then
+                            remaining_ratio = (finish_epoch - now) / lifetime_secs
+                        end
                     end
                 end
-                local calc_status, color = get_expiration_status(days_num, cert_type, lifetime_days)
+                local calc_status, color = get_expiration_status(days_num, cert_type, lifetime_days, remaining_ratio)
 
                 -- CA certs are always infrastructure; apply both type and window filters
                 local type_ok  = (filter == "all") or (filter == "infrastructure")
@@ -1175,9 +1196,13 @@ list_certs_from_badger = function(clientdata)
                         is_revoked = create_cfe("is_revoked", "false", "Revoked", "Is revoked", "boolean"),
                         path = create_cfe("path", cert_file, "File Path", "Path to file", "text"),
                         days_remaining = create_cfe("days_remaining",
-                            tostring(days_num or "N/A"), "Days Left", "Days left", "text"),
+                            finish_epoch and format_time_remaining(finish_epoch - now) or "N/A",
+                            "Remaining", "Time remaining", "text"),
                         expiration_date = create_cfe("expiration_date",
                             meta.not_after or "", "Expiration", "Expiration date", "text"),
+                        not_before = create_cfe("not_before",
+                            meta.not_before or "", "Valid From", "Certificate valid from date", "text"),
+                        _not_before_epoch = parse_date_to_epoch(meta.not_before or "") or 0,
                         status = create_cfe("status", calc_status, "Status", "Expiration/Revocation status", "text"),
                         color = create_cfe("color", color, "Status Color", "Status indicator color", "text"),
                         -- CA cert files are present; keys are CA secrets and not downloadable
@@ -1188,6 +1213,33 @@ list_certs_from_badger = function(clientdata)
                     })
                 end
             end
+        end
+    end
+
+    -- Assign issuance_status: most-recent non-revoked cert per CN = Active, earlier = Superseded
+    local cn_groups = {}
+    for _, entry in ipairs(certs) do
+        local cn = entry.subject.value
+        if not cn_groups[cn] then cn_groups[cn] = {} end
+        table.insert(cn_groups[cn], entry)
+    end
+    for _, group in pairs(cn_groups) do
+        table.sort(group, function(a, b)
+            return (a._not_before_epoch or 0) > (b._not_before_epoch or 0)
+        end)
+        local found_active = false
+        for _, entry in ipairs(group) do
+            local label
+            if entry.is_revoked.value == "true" then
+                label = "Revoked"
+            elseif not found_active then
+                label = "Active"
+                found_active = true
+            else
+                label = "Superseded"
+            end
+            entry.issuance_status = create_cfe("issuance_status", label,
+                "Issuance Status", "Active, Superseded, or Revoked", "text")
         end
     end
 
@@ -1206,8 +1258,37 @@ end
 
 
 -- Get certificate details
+-- Accepts serial= (primary) or cert_name= (legacy fallback)
 function mymodule.get_certificate_details(clientdata)
+    local serial    = clientdata.serial
     local cert_name = clientdata.cert_name
+
+    -- Resolve cert_name from serial via BadgerDB
+    if serial and serial ~= "" and not cert_name then
+        if not serial:match("^%d+$") then
+            return {error = create_cfe("error", "Invalid serial number", "Error", "", "text")}
+        end
+        if has_step_badger() and has_jq() then
+            local esc = serial:gsub("'", "'\\''")
+            local jq_f = string.format(
+                '.[] | select(.StringSerials.SerialDec == "%s") | .Certificate.Subject.CommonName', esc)
+            local cmd = string.format(
+                "T=$(mktemp -d /tmp/step-badger.XXXXXX) && cp -r '%s'/* \"$T\"/ 2>/dev/null;"
+                .. " export PATH='/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin';"
+                .. " step-badger x509Certs \"$T\" -re --emit json 2>/dev/null"
+                .. " | jq -r '%s' | head -1; rm -rf \"$T\"",
+                step_db_path, jq_f)
+            local cn = exec_command(cmd):gsub("%s+$", ""):gsub("^%s+", "")
+            if cn ~= "" and cn ~= "null" then
+                cert_name = cn
+            end
+        end
+        if not cert_name then
+            return {error = create_cfe("error",
+                "Certificate not found in database (serial: " .. serial .. ")", "Error", "", "text")}
+        end
+    end
+
     if not cert_name then
         return {error = create_cfe("error", "No certificate specified", "Error", "", "text")}
     end
@@ -1215,42 +1296,26 @@ function mymodule.get_certificate_details(clientdata)
     local cert_path = step_certs_path .. "/" .. cert_name .. ".crt"
 
     if not file_exists(cert_path) then
-        return {error = create_cfe("error", "Certificate not found: " .. cert_name, "Error", "", "text")}
+        return {error = create_cfe("error",
+            "No local file for '" .. cert_name
+            .. "'. This certificate was not issued via ACF and cannot be viewed here.",
+            "Error", "", "text")}
     end
 
     local details = {}
     details.cert_name = create_cfe("cert_name", cert_name, "Certificate Name", "", "text")
+    if serial and serial ~= "" then
+        details.serial = create_cfe("serial", serial, "Serial Number", "", "text")
+    end
 
-    -- Get full certificate inspection
     local inspect_cmd = "step certificate inspect " .. cert_path .. " 2>/dev/null"
-    details.inspection = create_cfe(
-        "inspection",
-        exec_command(inspect_cmd),
-        "Certificate Details",
-        "",
-        "longtext"
-    )
+    details.inspection = create_cfe("inspection", exec_command(inspect_cmd), "Certificate Details", "", "longtext")
 
-    -- Get PEM content
     local pem_content = fs.read_file(cert_path)
-    details.pem = create_cfe(
-        "pem",
-        pem_content,
-        "PEM Content",
-        "",
-        "longtext"
-    )
+    details.pem = create_cfe("pem", pem_content, "PEM Content", "", "longtext")
 
-    -- Check for corresponding private key
     local key_path = step_certs_path .. "/" .. cert_name .. ".key"
-    local has_key = file_exists(key_path)
-    details.has_key = create_cfe(
-        "has_key",
-        tostring(has_key),
-        "Private Key Available",
-        "",
-        "boolean"
-    )
+    details.has_key = create_cfe("has_key", tostring(file_exists(key_path)), "Private Key Available", "", "boolean")
 
     return details
 end
@@ -1550,42 +1615,53 @@ end
 -- Get revoke form
 function mymodule.get_revoke_form(clientdata)
     local form = {}
+    local serial = clientdata.serial or ""
 
-    form.serial = create_cfe(
-        "serial",
-        clientdata.serial or "",
-        "Serial Number",
-        "Certificate serial number to revoke",
-        "text"
-    )
+    form.serial = create_cfe("serial", serial,
+        "Serial Number", "Certificate serial number to revoke", "text")
 
-    form.reason = create_cfe(
-        "reason",
-        clientdata.reason or "unspecified",
-        "Revocation Reason",
-        "Reason for revocation",
-        "select",
-        {
-            "unspecified", "key-compromise", "ca-compromise", "affiliation-changed",
-            "superseded", "cessation-of-operation"
-        }
-    )
+    form.reason = create_cfe("reason", clientdata.reason or "unspecified",
+        "Revocation Reason", "Reason for revocation", "select",
+        {"unspecified", "key-compromise", "ca-compromise", "affiliation-changed",
+         "superseded", "cessation-of-operation"})
 
-    form.confirm = create_cfe(
-        "confirm",
-        clientdata.confirm or "",
-        "Confirmation",
-        "Type 'REVOKE' to confirm this destructive action",
-        "text"
-    )
+    form.confirm = create_cfe("confirm", clientdata.confirm or "",
+        "Confirmation", "Type 'REVOKE' to confirm this destructive action", "text")
 
-    form.cert_name = create_cfe(
-        "cert_name",
-        clientdata.cert_name or "",
-        "Certificate Name",
-        "Certificate filename for reference",
-        "text"
-    )
+    -- Look up cert identity from BadgerDB so the revoke page can show what's being revoked
+    if serial ~= "" and has_step_badger() and has_jq() then
+        local esc = serial:gsub("'", "'\\''")
+        local jq_f = string.format(
+            '.[] | select(.StringSerials.SerialDec == "%s")'
+            .. ' | {cn:.Certificate.Subject.CommonName,'
+            .. 'not_before:.Certificate.NotBefore,'
+            .. 'not_after:.Certificate.NotAfter}',
+            esc)
+        local cmd = string.format(
+            "T=$(mktemp -d /tmp/step-badger.XXXXXX) && cp -r '%s'/* \"$T\"/ 2>/dev/null;"
+            .. " export PATH='/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin';"
+            .. " step-badger x509Certs \"$T\" -re --emit json 2>/dev/null"
+            .. " | jq -c '%s' | head -1; rm -rf \"$T\"",
+            step_db_path, jq_f)
+        local raw = exec_command(cmd):gsub("%s+$", "")
+        if raw ~= "" and raw:sub(1, 1) == "{" then
+            local function js(obj, key)
+                return obj:match('"' .. key .. '":"([^"]*)"') or ""
+            end
+            local cn         = js(raw, "cn")
+            local not_before = js(raw, "not_before")
+            local not_after  = js(raw, "not_after")
+            if cn ~= "" then
+                form.cert_cn = create_cfe("cert_cn", cn, "Common Name", "", "text")
+            end
+            if not_before ~= "" then
+                form.cert_not_before = create_cfe("cert_not_before", not_before, "Valid From", "", "text")
+            end
+            if not_after ~= "" then
+                form.cert_not_after = create_cfe("cert_not_after", not_after, "Valid To", "", "text")
+            end
+        end
+    end
 
     return form
 end
@@ -1953,6 +2029,17 @@ function mymodule.list_provisioners()
         end
     end
 
+    -- Compute CA URL once for directory_url generation
+    local ca_url_for_list = ""
+    if has_jq() and file_exists(step_config) then
+        local dns = exec_command(string.format("jq -r '.dnsNames[0] // empty' '%s' 2>/dev/null", step_config)):gsub("%s+","")
+        local addr = exec_command(string.format("jq -r '.address // empty' '%s' 2>/dev/null", step_config)):gsub("%s+","")
+        local port = addr:match(":(%d+)$") or "443"
+        if dns ~= "" then
+            ca_url_for_list = string.format("https://%s:%s", dns, port)
+        end
+    end
+
     -- Convert to CFE format
     for _, prov in ipairs(provisioner_data) do
         local description, icon
@@ -1977,11 +2064,17 @@ function mymodule.list_provisioners()
             icon = "❓"
         end
 
+        local directory_url = ""
+        if prov.type == "ACME" and ca_url_for_list ~= "" then
+            directory_url = ca_url_for_list .. "/acme/" .. prov.name .. "/directory"
+        end
+
         table.insert(provisioners, {
             name = create_cfe("name", prov.name, "Name", "Provisioner name", "text"),
             type = create_cfe("type", prov.type, "Type", "Provisioner type", "text"),
             description = create_cfe("description", description, "Description", "Provisioner description", "text"),
-            icon = create_cfe("icon", icon, "Icon", "Visual indicator", "text")
+            icon = create_cfe("icon", icon, "Icon", "Visual indicator", "text"),
+            directory_url = create_cfe("directory_url", directory_url, "Directory URL", "ACME directory URL", "text"),
         })
     end
 
@@ -2115,6 +2208,21 @@ function mymodule.get_add_provisioner_form(clientdata)
         "text"
     )
 
+    -- ACME-specific options
+    form.require_eab = create_cfe("require_eab", clientdata.require_eab or "false", "Require EAB",
+        "Require External Account Binding — clients must have a pre-issued EAB key to register", "boolean")
+
+    form.force_cn = create_cfe("force_cn", clientdata.force_cn or "false", "Force Common Name",
+        "Always set Common Name in issued certificates (from the first SAN)", "boolean")
+
+    -- Individual challenge type checkboxes (default all enabled)
+    form.challenge_http01 = create_cfe("challenge_http01", clientdata.challenge_http01 or "true",
+        "http-01", "HTTP challenge: CA validates by fetching http://<domain>/.well-known/acme-challenge/<token> on port 80", "boolean")
+    form.challenge_dns01 = create_cfe("challenge_dns01", clientdata.challenge_dns01 or "true",
+        "dns-01", "DNS challenge: CA validates by querying _acme-challenge.<domain> TXT record. Required for wildcard certs.", "boolean")
+    form.challenge_tls_alpn01 = create_cfe("challenge_tls_alpn01", clientdata.challenge_tls_alpn01 or "true",
+        "tls-alpn-01", "TLS-ALPN challenge: CA validates via TLS handshake on port 443 with ALPN extension.", "boolean")
+
     return form
 end
 
@@ -2198,6 +2306,29 @@ function mymodule.add_provisioner(clientdata)
 
     elseif clientdata.prov_type == "ACME" then
         args = args .. "--type ACME "
+        if clientdata.require_eab == "on" or clientdata.require_eab == "true" then
+            args = args .. "--require-eab "
+        end
+        if clientdata.force_cn == "on" or clientdata.force_cn == "true" then
+            args = args .. "--force-cn "
+        end
+        -- Build challenge list from individual checkboxes
+        local challenges = {}
+        if clientdata.challenge_http01 == "on" or clientdata.challenge_http01 == "true" then
+            table.insert(challenges, "http-01")
+        end
+        if clientdata.challenge_dns01 == "on" or clientdata.challenge_dns01 == "true" then
+            table.insert(challenges, "dns-01")
+        end
+        if clientdata.challenge_tls_alpn01 == "on" or clientdata.challenge_tls_alpn01 == "true" then
+            table.insert(challenges, "tls-alpn-01")
+        end
+        -- Only restrict challenges if a proper subset is selected (all = default, no flag needed)
+        if #challenges > 0 and #challenges < 3 then
+            for _, ch in ipairs(challenges) do
+                args = args .. string.format("--challenge %s ", ch)
+            end
+        end
 
     elseif clientdata.prov_type == "SCEP" then
         args = args .. "--type SCEP "
@@ -2487,53 +2618,28 @@ function mymodule.get_config()
     -- Read current thresholds from config file or use defaults
     local thresholds = get_thresholds_from_config()
 
-    -- Infrastructure thresholds (days)
-    config.critical_days = create_cfe(
-        "critical_days",
-        tostring(thresholds.critical_days),
-        "Infrastructure: Critical Threshold (days)",
-        "Infrastructure certs (CA, Server, Client) expiring within this many days are marked as CRITICAL (🔴)",
-        "text"
-    )
-
-    config.warning_days = create_cfe(
-        "warning_days",
-        tostring(thresholds.warning_days),
-        "Infrastructure: Warning Threshold (days)",
-        "Infrastructure certs expiring within this many days are marked as WARNING (🟡)",
-        "text"
-    )
-
-    config.notice_days = create_cfe(
-        "notice_days",
-        tostring(thresholds.notice_days),
-        "Infrastructure: Notice Threshold (days)",
-        "Infrastructure certs expiring within this many days show advance notice (🔵)",
-        "text"
-    )
-
-    -- Ephemeral thresholds (percentages)
-    config.critical_percent = create_cfe(
-        "critical_percent",
-        tostring(thresholds.critical_percent),
-        "Ephemeral: Critical Threshold (%)",
-        "Ephemeral certs (WiFi, IoT) with ≤ this % of lifetime remaining are marked as CRITICAL (🔴)",
+    -- Expiration thresholds (% of lifetime remaining — ACME 1/3-lifetime model)
+    config.notice_percent = create_cfe(
+        "notice_percent",
+        tostring(thresholds.notice_percent),
+        "Notice Threshold (% lifetime remaining)",
+        "Certs with ≤ this % of lifetime remaining enter the renewal window (🔵). Default 33% = ACME 1/3-lifetime model.",
         "text"
     )
 
     config.warning_percent = create_cfe(
         "warning_percent",
         tostring(thresholds.warning_percent),
-        "Ephemeral: Warning Threshold (%)",
-        "Ephemeral certs with ≤ this % of lifetime remaining are marked as WARNING (🟡)",
+        "Warning Threshold (% lifetime remaining)",
+        "Certs with ≤ this % of lifetime remaining are marked WARNING (🟡). Default 16% ≈ halfway through renewal window.",
         "text"
     )
 
-    config.notice_percent = create_cfe(
-        "notice_percent",
-        tostring(thresholds.notice_percent),
-        "Ephemeral: Notice Threshold (%)",
-        "Ephemeral certs with ≤ this % of lifetime remaining show advance notice (🔵)",
+    config.critical_percent = create_cfe(
+        "critical_percent",
+        tostring(thresholds.critical_percent),
+        "Critical Threshold (% lifetime remaining)",
+        "Certs with ≤ this % of lifetime remaining are marked CRITICAL (🔴). Default 8% ≈ last quarter before expiry.",
         "text"
     )
 
@@ -2576,46 +2682,23 @@ end
 
 -- Save configuration
 function mymodule.save_config(clientdata)
-    -- Read all 6 threshold values
-    local critical_days = tonumber(clientdata.critical_days) or 7
-    local warning_days = tonumber(clientdata.warning_days) or 30
-    local notice_days = tonumber(clientdata.notice_days) or 90
-    local critical_percent = tonumber(clientdata.critical_percent) or 10
-    local warning_percent = tonumber(clientdata.warning_percent) or 30
-    local notice_percent = tonumber(clientdata.notice_percent) or 50
+    local critical_percent = tonumber(clientdata.critical_percent) or 8
+    local warning_percent  = tonumber(clientdata.warning_percent)  or 16
+    local notice_percent   = tonumber(clientdata.notice_percent)   or 33
 
-    -- Get the config form
     local result = mymodule.get_config()
 
-    -- Validate infrastructure thresholds (days)
-    if critical_days < 1 or critical_days > 365 then
-        result.error = create_cfe("error", "Infrastructure Critical must be 1-365 days", "Error", "", "text")
-        return result
-    end
-
-    if warning_days < critical_days or warning_days > 365 then
-        result.error = create_cfe("error", "Infrastructure Warning must be > critical days", "Error", "", "text")
-        return result
-    end
-
-    if notice_days < warning_days or notice_days > 365 then
-        result.error = create_cfe("error", "Infrastructure Notice must be > warning days", "Error", "", "text")
-        return result
-    end
-
-    -- Validate ephemeral thresholds (percentages)
+    -- Validate: thresholds must be ascending and within 1-100
     if critical_percent < 1 or critical_percent > 100 then
-        result.error = create_cfe("error", "Ephemeral Critical must be 1-100%", "Error", "", "text")
+        result.error = create_cfe("error", "Critical threshold must be 1-100%", "Error", "", "text")
         return result
     end
-
-    if warning_percent < critical_percent or warning_percent > 100 then
-        result.error = create_cfe("error", "Ephemeral Warning must be > critical %", "Error", "", "text")
+    if warning_percent <= critical_percent or warning_percent > 100 then
+        result.error = create_cfe("error", "Warning threshold must be > critical %", "Error", "", "text")
         return result
     end
-
-    if notice_percent < warning_percent or notice_percent > 100 then
-        result.error = create_cfe("error", "Ephemeral Notice must be > warning %", "Error", "", "text")
+    if notice_percent <= warning_percent or notice_percent > 100 then
+        result.error = create_cfe("error", "Notice threshold must be > warning %", "Error", "", "text")
         return result
     end
 
@@ -2639,24 +2722,20 @@ function mymodule.save_config(clientdata)
         end
     end
 
-    -- Write configuration file with all 6 thresholds
+    -- Write configuration file
+    -- Expiration thresholds follow the ACME 1/3-lifetime model (% of lifetime remaining).
     local config_content = string.format([[# ACF Configuration for step-ca
 
-# Infrastructure certificate expiration thresholds (in days for CA, Server, Client, Client-Server)
-CRITICAL_DAYS=%d
-WARNING_DAYS=%d
-NOTICE_DAYS=%d
-
-# Ephemeral certificate expiration thresholds (percentage of total lifetime for WiFi, IoT, short-lived)
-CRITICAL_PERCENT=%d
-WARNING_PERCENT=%d
+# Certificate expiration thresholds — percentage of total cert lifetime remaining.
+# ACME 1/3-lifetime model: NOTICE=33 (renewal window opens), WARNING=16, CRITICAL=8.
 NOTICE_PERCENT=%d
+WARNING_PERCENT=%d
+CRITICAL_PERCENT=%d
 
 # Service user for step-ca daemon (matches /etc/init.d/step-ca command_user)
 STEPCA_USER=step-ca
 ]],
-        critical_days, warning_days, notice_days,
-        critical_percent, warning_percent, notice_percent
+        notice_percent, warning_percent, critical_percent
     )
 
     local f = io.open(acf_config_file, "w")
@@ -2664,13 +2743,9 @@ STEPCA_USER=step-ca
         f:write(config_content)
         f:close()
         result.success = create_cfe("success", "Configuration saved successfully", "Success", "", "text")
-        -- Update the form values with the saved values (all 6 thresholds)
-        result.critical_days.value = tostring(critical_days)
-        result.warning_days.value = tostring(warning_days)
-        result.notice_days.value = tostring(notice_days)
+        result.notice_percent.value   = tostring(notice_percent)
+        result.warning_percent.value  = tostring(warning_percent)
         result.critical_percent.value = tostring(critical_percent)
-        result.warning_percent.value = tostring(warning_percent)
-        result.notice_percent.value = tostring(notice_percent)
     else
         result.error = create_cfe("error", "Failed to write configuration file", "Error", "", "text")
     end
@@ -3215,7 +3290,10 @@ function mymodule.get_provisioner_details(clientdata)
         prov_name = create_cfe("prov_name", prov_name, "Provisioner Name", "", "text"),
         full_json = create_cfe("full_json", full_json, "Full Configuration", "", "longtext"),
         claims_json = create_cfe("claims_json", claims_json, "Claims", "", "longtext"),
-        options_json = create_cfe("options_json", options_json, "Options (Templates)", "", "longtext")
+        options_json = create_cfe("options_json", options_json, "Options (Templates)", "", "longtext"),
+        prov_type = create_cfe("prov_type",
+            exec_command(string.format("jq -r '.authority.provisioners[] | select(.name == \"%s\") | .type // empty' '%s' 2>/dev/null", prov_name, step_config)):gsub("%s+",""),
+            "Type", "", "text"),
     }
 end
 
@@ -3692,6 +3770,199 @@ function mymodule.sign_ssh_cert(clientdata)
     end
 
     return result
+end
+
+-- =============================================================================
+-- ACME EAB (External Account Binding) Key Management
+-- =============================================================================
+
+-- Helper: build CA URL from ca.json
+local function get_ca_url()
+    local dns = exec_command(string.format("jq -r '.dnsNames[0] // empty' '%s' 2>/dev/null", step_config)):gsub("%s+","")
+    local addr = exec_command(string.format("jq -r '.address // empty' '%s' 2>/dev/null", step_config)):gsub("%s+","")
+    local port = addr:match(":(%d+)$") or "443"
+    if dns == "" then return "" end
+    return string.format("https://%s:%s", dns, port)
+end
+
+-- Get ACME EAB management page data.
+-- With credentials in clientdata: also lists existing EAB keys.
+function mymodule.get_acme_eab_form(clientdata)
+    local result = {}
+
+    if not has_jq() then
+        return { error = create_cfe("error", "The 'jq' utility is required.", "Error", "", "text") }
+    end
+
+    -- Enumerate provisioners from ca.json
+    local acme_provs = {}
+    local jwk_provs = {}
+    local prov_list = mymodule.list_provisioners()
+    if prov_list.provisioners then
+        for _, p in ipairs(prov_list.provisioners) do
+            if p.type and p.type.value == "ACME" then
+                table.insert(acme_provs, p.name.value)
+            elseif p.type and p.type.value == "JWK" then
+                table.insert(jwk_provs, p.name.value)
+            end
+        end
+    end
+
+    if #acme_provs == 0 then
+        return { error = create_cfe("error",
+            "No ACME provisioners configured. Add an ACME provisioner first.", "Error", "", "text") }
+    end
+
+    local ca_url = get_ca_url()
+    local selected_prov = clientdata.acme_prov or acme_provs[1] or ""
+    local selected_admin = clientdata.admin_prov or (jwk_provs[1] or "")
+
+    local directory_url = ""
+    if ca_url ~= "" and selected_prov ~= "" then
+        directory_url = string.format("%s/acme/%s/directory", ca_url, selected_prov)
+    end
+
+    result.acme_prov    = create_cfe("acme_prov", selected_prov, "ACME Provisioner",
+        "The ACME provisioner to manage EAB keys for", "select", acme_provs)
+    result.admin_prov   = create_cfe("admin_prov", selected_admin, "Admin Provisioner",
+        "JWK provisioner used for admin authentication", "select", jwk_provs)
+    result.admin_password = create_cfe("admin_password", "", "Admin Password",
+        "Password for the selected JWK provisioner", "password")
+    result.ca_url       = create_cfe("ca_url", ca_url, "CA URL", "URL of the running CA", "text")
+    result.directory_url = create_cfe("directory_url", directory_url,
+        "ACME Directory URL", "Point ACME clients at this URL", "text")
+
+    -- If credentials provided, list existing keys
+    local admin_password = clientdata.admin_password or ""
+    if admin_password ~= "" and selected_prov ~= "" and selected_admin ~= "" and ca_url ~= "" then
+        local tmp_pass = string.format("/tmp/eab_list_%d.txt", math.random(10000, 99999))
+        local f = io.open(tmp_pass, "w")
+        if f then f:write(admin_password); f:close() end
+
+        local root_cert = step_certs_path .. "/root_ca.crt"
+        local cmd = string.format(
+            "step ca acme eab list '%s' --ca-url '%s' --root '%s' --admin-provisioner '%s' --admin-password-file '%s' 2>&1",
+            selected_prov, ca_url, root_cert, selected_admin, tmp_pass)
+        local output = exec_as_stepca(cmd)
+        os.remove(tmp_pass)
+
+        -- Parse key list: skip header line, extract Key ID per data line
+        local keys = {}
+        local line_num = 0
+        for line in output:gmatch("[^\n]+") do
+            line_num = line_num + 1
+            if line_num > 1 and line ~= "" and not line:lower():match("^error") then
+                -- First whitespace-separated token is the Key ID
+                local key_id = line:match("^(%S+)")
+                local bound  = line:match("%s+(true)%s") or line:match("%s+(false)%s") or "?"
+                local created = line:match("(%d%d%d%d%-%d%d%-%d%d)") or ""
+                if key_id then
+                    table.insert(keys, { id = key_id, bound = bound, created = created })
+                end
+            end
+        end
+
+        result.eab_keys = keys
+        result.list_error = output:lower():match("error") and
+            create_cfe("list_error", output, "List Error", "", "text") or nil
+        -- Keep credentials for add/remove forms
+        result.admin_prov_val   = create_cfe("admin_prov_val", selected_admin, "", "", "text")
+        result.admin_password_hidden = create_cfe("admin_password_hidden", admin_password, "", "", "text")
+    end
+
+    return result
+end
+
+-- Add a new ACME EAB key.
+function mymodule.add_acme_eab_key(clientdata)
+    local acme_prov     = (clientdata.acme_prov or ""):gsub("^%s*(.-)%s*$", "%1")
+    local admin_prov    = (clientdata.admin_prov or ""):gsub("^%s*(.-)%s*$", "%1")
+    local admin_password = clientdata.admin_password or ""
+    local ca_url        = (clientdata.ca_url or ""):gsub("^%s*(.-)%s*$", "%1")
+
+    if acme_prov == "" or admin_prov == "" or admin_password == "" or ca_url == "" then
+        return { error = create_cfe("error",
+            "ACME provisioner, admin provisioner, password, and CA URL are all required.", "Error", "", "text") }
+    end
+
+    local tmp_pass = string.format("/tmp/eab_add_%d.txt", math.random(10000, 99999))
+    local f = io.open(tmp_pass, "w")
+    if f then f:write(admin_password); f:close() end
+
+    local root_cert = step_certs_path .. "/root_ca.crt"
+    local cmd = string.format(
+        "step ca acme eab add '%s' --ca-url '%s' --root '%s' --admin-provisioner '%s' --admin-password-file '%s' 2>&1",
+        acme_prov, ca_url, root_cert, admin_prov, tmp_pass)
+    local output = exec_as_stepca(cmd)
+    os.remove(tmp_pass)
+
+    local directory_url = string.format("%s/acme/%s/directory", ca_url, acme_prov)
+
+    if output == "" or (output:lower():match("error") and not output:match("Key ID")) then
+        return {
+            error = create_cfe("error", "Failed to add EAB key:\n" .. output, "Error", "", "text"),
+            acme_prov = create_cfe("acme_prov", acme_prov, "ACME Provisioner", "", "text"),
+        }
+    end
+
+    -- Try to extract KeyID and Key from output
+    local key_id  = output:match("Key ID[%s:]+([%w%-_]+)") or output:match('"id"%s*:%s*"([^"]+)"') or ""
+    local hmac_key = output:match('"k"%s*:%s*"([^"]+)"') or output:match('"key"%s*:%s*"([^"]+)"') or ""
+
+    return {
+        success      = create_cfe("success", "EAB key generated", "Success", "", "text"),
+        acme_prov    = create_cfe("acme_prov", acme_prov, "ACME Provisioner", "", "text"),
+        eab_key_id   = create_cfe("eab_key_id", key_id, "Key ID", "EAB Key ID (not secret)", "text"),
+        eab_hmac_key = create_cfe("eab_hmac_key", hmac_key, "HMAC Key",
+            "Secret HMAC key — shown once, cannot be retrieved again", "text"),
+        eab_output   = create_cfe("eab_output", output, "Full Output", "Raw command output", "longtext"),
+        directory_url = create_cfe("directory_url", directory_url, "ACME Directory URL", "", "text"),
+        admin_prov   = create_cfe("admin_prov", admin_prov, "Admin Provisioner", "", "text"),
+        admin_password = create_cfe("admin_password", admin_password, "Admin Password", "", "password"),
+        ca_url       = create_cfe("ca_url", ca_url, "CA URL", "", "text"),
+    }
+end
+
+-- Remove an ACME EAB key.
+function mymodule.remove_acme_eab_key(clientdata)
+    local acme_prov     = (clientdata.acme_prov or ""):gsub("^%s*(.-)%s*$", "%1")
+    local key_id        = (clientdata.key_id or ""):gsub("^%s*(.-)%s*$", "%1")
+    local admin_prov    = (clientdata.admin_prov or ""):gsub("^%s*(.-)%s*$", "%1")
+    local admin_password = clientdata.admin_password or ""
+    local ca_url        = (clientdata.ca_url or ""):gsub("^%s*(.-)%s*$", "%1")
+
+    if acme_prov == "" or key_id == "" or admin_prov == "" or admin_password == "" then
+        return { error = create_cfe("error", "All fields required to remove an EAB key.", "Error", "", "text") }
+    end
+
+    local tmp_pass = string.format("/tmp/eab_rm_%d.txt", math.random(10000, 99999))
+    local f = io.open(tmp_pass, "w")
+    if f then f:write(admin_password); f:close() end
+
+    local root_cert = step_certs_path .. "/root_ca.crt"
+    local cmd = string.format(
+        "step ca acme eab remove '%s' '%s' --ca-url '%s' --root '%s' --admin-provisioner '%s' --admin-password-file '%s' 2>&1",
+        acme_prov, key_id, ca_url, root_cert, admin_prov, tmp_pass)
+    local output = exec_as_stepca(cmd)
+    os.remove(tmp_pass)
+
+    if output:lower():match("error") then
+        return {
+            error = create_cfe("error", "Failed to remove EAB key '" .. key_id .. "':\n" .. output, "Error", "", "text"),
+            acme_prov    = create_cfe("acme_prov", acme_prov, "", "", "text"),
+            admin_prov   = create_cfe("admin_prov", admin_prov, "", "", "text"),
+            admin_password = create_cfe("admin_password", admin_password, "", "", "password"),
+            ca_url       = create_cfe("ca_url", ca_url, "", "", "text"),
+        }
+    end
+
+    return {
+        removed_key  = create_cfe("removed_key", key_id, "Removed Key", "", "text"),
+        acme_prov    = create_cfe("acme_prov", acme_prov, "", "", "text"),
+        admin_prov   = create_cfe("admin_prov", admin_prov, "", "", "text"),
+        admin_password = create_cfe("admin_password", admin_password, "", "", "password"),
+        ca_url       = create_cfe("ca_url", ca_url, "", "", "text"),
+    }
 end
 
 return mymodule

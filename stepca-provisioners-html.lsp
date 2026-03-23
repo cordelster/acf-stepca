@@ -27,6 +27,11 @@
 		<div style="margin-bottom: 10px; color: #666;">
 			<%= html.html_escape(prov.description.value) %>
 		</div>
+		<% if prov.type.value == "ACME" and prov.directory_url and prov.directory_url.value ~= "" then %>
+		<div style="margin-bottom: 10px; font-size: 12px; color: #555;">
+			<strong>Directory URL:</strong> <code><%= html.html_escape(prov.directory_url.value) %></code>
+		</div>
+		<% end %>
 		<a href="<%= html.html_escape(page_info.script .. page_info.prefix .. page_info.controller .. "/provisionerdetails?prov_name=" .. prov.name.value) %>"
 			class="btn btn-default btn-sm"
 			style="display: inline-block; padding: 5px 10px; font-size: 12px; color: #333; background-color: #fff; border: 1px solid #ccc; border-radius: 3px; text-decoration: none; margin-right: 5px;">
@@ -42,6 +47,13 @@
 			class="btn btn-warning btn-sm"
 			style="display: inline-block; padding: 5px 10px; font-size: 12px; color: #fff; background-color: #f0ad4e; border: 1px solid #eea236; border-radius: 3px; text-decoration: none; margin-right: 5px;">
 			<i class="icon-ticket"></i> Generate Token
+		</a>
+		<% end %>
+		<% if prov.type.value == "ACME" then %>
+		<a href="<%= html.html_escape(page_info.script .. page_info.prefix .. page_info.controller .. "/acmeeab?acme_prov=" .. prov.name.value) %>"
+			class="btn btn-warning btn-sm"
+			style="display: inline-block; padding: 5px 10px; font-size: 12px; color: #fff; background-color: #f0ad4e; border: 1px solid #eea236; border-radius: 3px; text-decoration: none; margin-right: 5px;">
+			<i class="icon-key"></i> Manage EAB Keys
 		</a>
 		<% end %>
 		<a href="<%= html.html_escape(page_info.script .. page_info.prefix .. page_info.controller .. "/deleteprovisioner?prov_name=" .. prov.name.value) %>"

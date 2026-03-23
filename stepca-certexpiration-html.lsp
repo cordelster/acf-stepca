@@ -19,7 +19,7 @@
 				<tr>
 					<th>Certificate</th>
 					<th>Common Name</th>
-					<th>Days Remaining</th>
+					<th>Remaining</th>
 					<th>Expiration Date</th>
 					<th>Status</th>
 					<th>Actions</th>
@@ -38,7 +38,7 @@
 						</span>
 					</td>
 					<td>
-						<a href="<%= html.html_escape(page_info.script .. page_info.prefix .. page_info.controller .. "/viewcert?cert_name=" .. cert.name.value) %>"
+						<a href="<%= html.html_escape(page_info.script .. page_info.prefix .. page_info.controller .. "/viewcert?serial=" .. cert.serial.value) %>"
 							class="btn btn-xs btn-info">
 							<i class="icon-eye-open"></i> View
 						</a>
@@ -56,12 +56,15 @@
 </div>
 
 <div class="alert alert-info">
-	<h4>Color Coding:</h4>
+	<h4>Status â ACME 1/3-lifetime model</h4>
 	<ul>
-		<li><span class="label label-danger">Red</span> - Expires in 7 days or less (CRITICAL)</li>
-		<li><span class="label label-warning">Yellow</span> - Expires in 30 days or less (WARNING)</li>
-		<li><span class="label label-success">Green</span> - More than 30 days remaining (OK)</li>
+		<li><span class="label label-success">Valid</span> â More than 1/3 of lifetime remaining</li>
+		<li><span class="label label-primary">Soon</span> â Renewal window open (â¤ 33% remaining)</li>
+		<li><span class="label label-warning">Warning</span> â Renewal overdue (â¤ 16% remaining)</li>
+		<li><span class="label label-danger">Critical</span> â Urgent renewal needed (â¤ 8% remaining)</li>
+		<li><span class="label label-danger">Expired</span> â Certificate has expired</li>
 	</ul>
+	<p class="text-muted" style="margin-top: 8px; margin-bottom: 0;"><small>Thresholds are configurable in PKI Configuration.</small></p>
 </div>
 
 <div class="form-group">

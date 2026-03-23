@@ -191,14 +191,32 @@ kanidm system oauth2 show-basic-secret step-ca</pre>
 	</fieldset>
 
 	<fieldset id="acme-help" style="margin-top: 30px; display: none;">
-		<legend>ACME Provisioner Information</legend>
-		<p><strong>ACME (Automatic Certificate Management Environment)</strong> is the protocol used by Let's Encrypt and other public CAs.</p>
-		<ul>
-			<li>No additional configuration required</li>
-			<li>Clients use ACME protocol to request certificates automatically</li>
-			<li>Supports challenge types: http-01, dns-01, tls-alpn-01</li>
-			<li>Ideal for automated certificate renewal (certbot, acme.sh, etc.)</li>
-		</ul>
+		<legend>ACME Provisioner Configuration</legend>
+		<p><strong>ACME (Automatic Certificate Management Environment)</strong> is the protocol used by Let's Encrypt and similar CAs. Clients authenticate by proving control of a domain via a challenge, not a password.</p>
+
+		<div class="form-group" style="margin-bottom: 20px;">
+			<label><strong>Challenge Types</strong></label>
+			<p><small style="color: #777;">Which challenge types this provisioner accepts. All three are enabled by default. On a private network, <code>http-01</code> is simplest — step-ca fetches <code>http://&lt;client&gt;:80/.well-known/acme-challenge/&lt;token&gt;</code>.</small></p>
+			<div style="margin-left: 20px;">
+				<label><input type="checkbox" name="challenge_http01" value="true" checked> <strong>http-01</strong> — port 80 HTTP validation (simplest for LAN)</label><br>
+				<label><input type="checkbox" name="challenge_dns01" value="true" checked> <strong>dns-01</strong> — DNS TXT record validation (required for wildcards)</label><br>
+				<label><input type="checkbox" name="challenge_tls_alpn01" value="true" checked> <strong>tls-alpn-01</strong> — TLS on port 443 with ALPN extension</label>
+			</div>
+		</div>
+
+		<div class="form-group" style="margin-bottom: 20px;">
+			<label><strong>Security Options</strong></label>
+			<div style="margin-left: 20px;">
+				<label><input type="checkbox" name="require_eab" value="true"> <strong>Require EAB (External Account Binding)</strong></label>
+				<p><small style="color: #777;">When enabled, clients must present a pre-issued EAB key to register an ACME account. Recommended for production — prevents unauthorized clients from getting certificates. Manage EAB keys from the Provisioners page after creating this provisioner.</small></p>
+				<label><input type="checkbox" name="force_cn" value="true"> <strong>Force Common Name</strong></label>
+				<p><small style="color: #777;">Always populate the CN field from the first SAN. Required by some legacy clients.</small></p>
+			</div>
+		</div>
+
+		<div class="alert alert-info" style="margin-top: 15px;">
+			<strong>After adding this provisioner:</strong> restart step-ca, then find your ACME directory URL at <em>Provisioners &rarr; Manage EAB Keys</em>.
+		</div>
 	</fieldset>
 
 	<fieldset id="jwk-help" style="margin-top: 30px; display: none;">
