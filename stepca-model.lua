@@ -22,6 +22,40 @@ local function exec_command(cmd)
     return result or ""
 end
 
+-- Wall-clock timer with nanosecond precision.
+-- luaposix <= 34: posix.clock_gettime(id) -> sec, nsec
+-- luaposix >= 35: posix.time.clock_gettime(id) -> {tv_sec, tv_nsec}
+-- Falls back to /proc/uptime (centisecond), then os.clock().
+local _cgt = (function()
+    if posix.clock_gettime then
+        return function()
+            local ok, a, b = pcall(posix.clock_gettime, 1)
+            if ok and type(a) == "number" then return a + b / 1e9 end
+        end
+    end
+    local ok, pt = pcall(require, "posix.time")
+    if ok and pt and pt.clock_gettime then
+        return function()
+            local ok2, ts = pcall(pt.clock_gettime, pt.CLOCK_MONOTONIC or 1)
+            if ok2 and ts and ts.tv_sec then return ts.tv_sec + ts.tv_nsec / 1e9 end
+        end
+    end
+end)()
+
+local function wall_time()
+    if _cgt then
+        local t = _cgt()
+        if t then return t end
+    end
+    local f = io.open("/proc/uptime", "r")
+    if f then
+        local line = f:read("*l"); f:close()
+        local u = tonumber(line and line:match("^([%d%.]+)"))
+        if u then return u end
+    end
+    return os.clock()
+end
+
 -- Helper to check if jq is installed
 local function has_jq()
     local res = exec_command("which jq 2>/dev/null")
@@ -772,9 +806,9 @@ local function load_bulk_certificate_data()
     )
 
     -- Run as root for maximum reliability (reading DB)
-    local start_time = os.clock()
+    local start_time = wall_time()
     local output = exec_command(cmd)
-    local end_time = os.clock()
+    local end_time = wall_time()
 
     -- If output is empty or contains an error, step-badger failed or is missing
     if not output or output == "" or output:lower():match("error") then
@@ -960,7 +994,7 @@ function mymodule.list_certificates(clientdata)
             {"smart", "24h", "1w", "all"}
         ),
         db_exec_time = create_cfe(
-            "db_exec_time", db_exec_time and string.format("%.4f", db_exec_time) or "",
+            "db_exec_time", db_exec_time and string.format("%.9f", db_exec_time) or "",
             "DB Load Time", "Execution time of bulk loader", "text"
         )
     }
@@ -1004,7 +1038,7 @@ list_certs_from_badger = function(clientdata)
         .. '"eku":(.Certificate.ExtKeyUsage // [] | map(tostring) | join(","))'
         .. '}'
 
-    local t0 = os.time()
+    local t0 = wall_time()
     local full_cmd = string.format(
         "T=$(mktemp -d /tmp/step-badger.XXXXXX) && cp -r '%s'/* \"$T\"/ 2>/dev/null;"
         .. " export PATH='/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin';"
@@ -1015,7 +1049,7 @@ list_certs_from_badger = function(clientdata)
         jq_filter
     )
     local raw_output = exec_command(full_cmd)
-    local exec_time  = os.time() - t0
+    local exec_time  = wall_time() - t0
 
     -- Extract a quoted string value from a compact JSON object line
     local function js(obj, key)
@@ -1252,7 +1286,7 @@ list_certs_from_badger = function(clientdata)
             "Show expired", "How far back to show expired certs", "select",
             {"smart", "24h", "1w", "all"}),
         db_exec_time = create_cfe("db_exec_time",
-            string.format("%.1f", exec_time), "DB Load Time", "Execution time of bulk loader", "text"),
+            string.format("%.9f", exec_time), "DB Load Time", "Execution time of bulk loader", "text"),
     }
 end
 
