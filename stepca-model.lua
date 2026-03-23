@@ -907,9 +907,9 @@ function mymodule.list_certificates(clientdata)
                 local exp_epoch = parse_date_to_epoch(not_after)
                 local start_epoch = parse_date_to_epoch(not_before)
 
+                local now_ts = os.time()
                 local remaining_ratio
                 if exp_epoch then
-                    local now_ts = os.time()
                     days_remaining = math.floor((exp_epoch - now_ts) / 86400)
                     if start_epoch then
                         total_lifetime_days = math.floor((exp_epoch - start_epoch) / 86400)
@@ -920,7 +920,8 @@ function mymodule.list_certificates(clientdata)
                     end
                 end
 
-                local calc_status, color = get_expiration_status(days_remaining, cert_type, total_lifetime_days, remaining_ratio)
+                local calc_status, color = get_expiration_status(
+                    days_remaining, cert_type, total_lifetime_days, remaining_ratio)
 
                 -- Overwrite status if DB says it's revoked
                 if status == "Revoked" then
@@ -1179,7 +1180,8 @@ list_certs_from_badger = function(clientdata)
                     finish_epoch and format_time_remaining(finish_epoch - now) or "N/A",
                     "Remaining", "Time remaining", "text"),
                 expiration_date = create_cfe("expiration_date", rec.not_after, "Expiration", "Expiration date", "text"),
-                not_before = create_cfe("not_before", rec.not_before, "Valid From", "Certificate valid from date", "text"),
+                not_before = create_cfe("not_before", rec.not_before,
+                    "Valid From", "Certificate valid from date", "text"),
                 _not_before_epoch = parse_date_to_epoch(rec.not_before) or 0,
                 status = create_cfe("status", calc_status, "Status", "Expiration/Revocation status", "text"),
                 color = create_cfe("color", color, "Status Color", "Status indicator color", "text"),
@@ -2067,8 +2069,10 @@ function mymodule.list_provisioners()
     -- Compute CA URL once for directory_url generation
     local ca_url_for_list = ""
     if has_jq() and file_exists(step_config) then
-        local dns = exec_command(string.format("jq -r '.dnsNames[0] // empty' '%s' 2>/dev/null", step_config)):gsub("%s+","")
-        local addr = exec_command(string.format("jq -r '.address // empty' '%s' 2>/dev/null", step_config)):gsub("%s+","")
+        local dns = exec_command(
+            string.format("jq -r '.dnsNames[0] // empty' '%s' 2>/dev/null", step_config)):gsub("%s+","")
+        local addr = exec_command(
+            string.format("jq -r '.address // empty' '%s' 2>/dev/null", step_config)):gsub("%s+","")
         local port = addr:match(":(%d+)$") or "443"
         if dns ~= "" then
             ca_url_for_list = string.format("https://%s:%s", dns, port)
@@ -2252,9 +2256,9 @@ function mymodule.get_add_provisioner_form(clientdata)
 
     -- Individual challenge type checkboxes (default all enabled)
     form.challenge_http01 = create_cfe("challenge_http01", clientdata.challenge_http01 or "true",
-        "http-01", "HTTP challenge: CA validates by fetching http://<domain>/.well-known/acme-challenge/<token> on port 80", "boolean")
+        "http-01", "HTTP challenge: CA fetches /.well-known/acme-challenge/<token> on port 80.", "boolean")
     form.challenge_dns01 = create_cfe("challenge_dns01", clientdata.challenge_dns01 or "true",
-        "dns-01", "DNS challenge: CA validates by querying _acme-challenge.<domain> TXT record. Required for wildcard certs.", "boolean")
+        "dns-01", "DNS challenge: CA queries _acme-challenge.<domain> TXT record. Required for wildcards.", "boolean")
     form.challenge_tls_alpn01 = create_cfe("challenge_tls_alpn01", clientdata.challenge_tls_alpn01 or "true",
         "tls-alpn-01", "TLS-ALPN challenge: CA validates via TLS handshake on port 443 with ALPN extension.", "boolean")
 
@@ -2598,7 +2602,7 @@ function mymodule.get_config()
         "notice_percent",
         tostring(thresholds.notice_percent),
         "Notice Threshold (% lifetime remaining)",
-        "Certs with ≤ this % of lifetime remaining enter the renewal window (🔵). Default 33% = ACME 1/3-lifetime model.",
+        "Renewal window opens at this % of lifetime remaining. Default: 33% (ACME 1/3-lifetime).",
         "text"
     )
 
@@ -2606,7 +2610,7 @@ function mymodule.get_config()
         "warning_percent",
         tostring(thresholds.warning_percent),
         "Warning Threshold (% lifetime remaining)",
-        "Certs with ≤ this % of lifetime remaining are marked WARNING (🟡). Default 16% ≈ halfway through renewal window.",
+        "Warning status at this % of lifetime remaining. Default: 16% (halfway through renewal window).",
         "text"
     )
 
@@ -2614,7 +2618,7 @@ function mymodule.get_config()
         "critical_percent",
         tostring(thresholds.critical_percent),
         "Critical Threshold (% lifetime remaining)",
-        "Certs with ≤ this % of lifetime remaining are marked CRITICAL (🔴). Default 8% ≈ last quarter before expiry.",
+        "Critical status at this % of lifetime remaining. Default: 8% (last quarter before expiry).",
         "text"
     )
 
@@ -3227,7 +3231,8 @@ function mymodule.create_client_certificate(clientdata)
                 "Root CA Certificate", "Install as trusted CA on client", "longtext")
         end
 
-        local instructions = "Install the Root CA as a trusted certificate authority, then install the client certificate and private key on the target device."
+        local instructions = "Install the Root CA as a trusted CA, then install"
+            .. " the client certificate and private key on the target device."
         result.instructions = create_cfe("instructions", instructions, "Installation Instructions", "", "longtext")
     else
         local clean = output:gsub("%[%d[;%d]*m", ""):gsub("\27%[%d[;%d]*m", "")
@@ -3271,7 +3276,9 @@ function mymodule.get_provisioner_details(clientdata)
         claims_json = create_cfe("claims_json", claims_json, "Claims", "", "longtext"),
         options_json = create_cfe("options_json", options_json, "Options (Templates)", "", "longtext"),
         prov_type = create_cfe("prov_type",
-            exec_command(string.format("jq -r '.authority.provisioners[] | select(.name == \"%s\") | .type // empty' '%s' 2>/dev/null", prov_name, step_config)):gsub("%s+",""),
+            exec_command(string.format(
+                "jq -r '.authority.provisioners[] | select(.name == \"%s\") | .type // empty' '%s' 2>/dev/null",
+                prov_name, step_config)):gsub("%s+",""),
             "Type", "", "text"),
     }
 end
@@ -3757,8 +3764,10 @@ end
 
 -- Helper: build CA URL from ca.json
 local function get_ca_url()
-    local dns = exec_command(string.format("jq -r '.dnsNames[0] // empty' '%s' 2>/dev/null", step_config)):gsub("%s+","")
-    local addr = exec_command(string.format("jq -r '.address // empty' '%s' 2>/dev/null", step_config)):gsub("%s+","")
+    local dns = exec_command(
+        string.format("jq -r '.dnsNames[0] // empty' '%s' 2>/dev/null", step_config)):gsub("%s+","")
+    local addr = exec_command(
+        string.format("jq -r '.address // empty' '%s' 2>/dev/null", step_config)):gsub("%s+","")
     local port = addr:match(":(%d+)$") or "443"
     if dns == "" then return "" end
     return string.format("https://%s:%s", dns, port)
@@ -3820,7 +3829,8 @@ function mymodule.get_acme_eab_form(clientdata)
 
         local root_cert = step_certs_path .. "/root_ca.crt"
         local cmd = string.format(
-            "step ca acme eab list '%s' --ca-url '%s' --root '%s' --admin-provisioner '%s' --admin-password-file '%s' 2>&1",
+            "step ca acme eab list '%s' --ca-url '%s' --root '%s'"
+            .. " --admin-provisioner '%s' --admin-password-file '%s' 2>&1",
             selected_prov, ca_url, root_cert, selected_admin, tmp_pass)
         local output = exec_as_stepca(cmd)
         os.remove(tmp_pass)
@@ -3920,14 +3930,16 @@ function mymodule.remove_acme_eab_key(clientdata)
 
     local root_cert = step_certs_path .. "/root_ca.crt"
     local cmd = string.format(
-        "step ca acme eab remove '%s' '%s' --ca-url '%s' --root '%s' --admin-provisioner '%s' --admin-password-file '%s' 2>&1",
+        "step ca acme eab remove '%s' '%s' --ca-url '%s' --root '%s'"
+        .. " --admin-provisioner '%s' --admin-password-file '%s' 2>&1",
         acme_prov, key_id, ca_url, root_cert, admin_prov, tmp_pass)
     local output = exec_as_stepca(cmd)
     os.remove(tmp_pass)
 
     if output:lower():match("error") then
         return {
-            error = create_cfe("error", "Failed to remove EAB key '" .. key_id .. "':\n" .. output, "Error", "", "text"),
+            error = create_cfe("error",
+                "Failed to remove EAB key '" .. key_id .. "':\n" .. output, "Error", "", "text"),
             acme_prov    = create_cfe("acme_prov", acme_prov, "", "", "text"),
             admin_prov   = create_cfe("admin_prov", admin_prov, "", "", "text"),
             admin_password = create_cfe("admin_password", admin_password, "", "", "password"),
