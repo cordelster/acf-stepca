@@ -2,7 +2,7 @@ include config.mk
 
 APP_NAME=stepca
 PACKAGE=acf-$(APP_NAME)
-VERSION=0.1.3
+VERSION=0.1.4
 
 APP_DIST=\
 	$(APP_NAME)*.lua \
