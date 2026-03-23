@@ -210,6 +210,29 @@ function mymodule.deleteprovisioner(self)
     return self.model.delete_provisioner(self.clientdata)
 end
 
+-- ACME EAB key management
+function mymodule.acmeeab(self)
+    return self.model.get_acme_eab_form(self.clientdata)
+end
+
+function mymodule.addacmeeab(self)
+    return self.model.add_acme_eab_key(self.clientdata)
+end
+
+function mymodule.removeacmeeab(self)
+    local result = self.model.remove_acme_eab_key(self.clientdata)
+    -- After removal, go back to EAB list (pass through credentials so list reloads)
+    if not result.error then
+        self.clientdata.acme_prov   = result.acme_prov and result.acme_prov.value
+        self.clientdata.admin_prov  = result.admin_prov and result.admin_prov.value
+        self.clientdata.admin_password = result.admin_password and result.admin_password.value
+        self.clientdata.ca_url      = result.ca_url and result.ca_url.value
+        self.conf.action = "acmeeab"
+        return self.model.get_acme_eab_form(self.clientdata)
+    end
+    return result
+end
+
 -- ===========================================================================
 -- Configuration and Audit Actions
 -- ===========================================================================

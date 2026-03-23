@@ -70,7 +70,6 @@
 
 	<fieldset>
 		<legend>Certificate Validity Periods</legend>
-		<% htmlviewfunctions.displayformitem(view.ca_validity_years) %>
 		<% htmlviewfunctions.displayformitem(view.ca_provisioner) %>
 		<% htmlviewfunctions.displayformitem(view.gen_intermediate) %>
 		<% htmlviewfunctions.displayformitem(view.intermediate_validity_years) %>

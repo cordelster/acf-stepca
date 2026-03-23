@@ -69,46 +69,17 @@
 			<!-- Certificate Expiration Thresholds -->
 			<h4 class="text-primary">🏛️ Expiration Thresholds</h4>
 			<p class="text-muted" style="margin-bottom: 20px;">
-				<small>Configure when certificates should be flagged based on remaining lifetime.</small>
+				<small>All certificates use the ACME 1/3-lifetime model — status is based on % of lifetime remaining, not a fixed number of days. Default: 🔵 33% (renewal window opens) → 🟡 16% → 🔴 8% (critical).</small>
 			</p>
 
-			<!-- Infrastructure -->
 			<div class="form-group">
-				<label class="col-sm-3 control-label">Infrastructure (Fixed Days)</label>
+				<label class="col-sm-3 control-label">Thresholds (% lifetime remaining)</label>
 				<div class="col-sm-9">
 					<div class="row">
 						<div class="col-xs-4">
 							<div class="input-group">
-								<span class="input-group-addon" title="Critical">🔴</span>
-								<input type="number" name="critical_days" class="form-control" value="<%= html.html_escape(view.critical_days.value) %>" min="1">
-							</div>
-						</div>
-						<div class="col-xs-4">
-							<div class="input-group">
-								<span class="input-group-addon" title="Warning">🟡</span>
-								<input type="number" name="warning_days" class="form-control" value="<%= html.html_escape(view.warning_days.value) %>" min="1">
-							</div>
-						</div>
-						<div class="col-xs-4">
-							<div class="input-group">
-								<span class="input-group-addon" title="Notice">🔵</span>
-								<input type="number" name="notice_days" class="form-control" value="<%= html.html_escape(view.notice_days.value) %>" min="1">
-							</div>
-						</div>
-					</div>
-					<p class="help-block">Days remaining for CA, Server, and Client certificates.</p>
-				</div>
-			</div>
-
-			<!-- Ephemeral -->
-			<div class="form-group">
-				<label class="col-sm-3 control-label">Ephemeral (Percentage)</label>
-				<div class="col-sm-9">
-					<div class="row">
-						<div class="col-xs-4">
-							<div class="input-group">
-								<span class="input-group-addon" title="Critical">🔴</span>
-								<input type="number" name="critical_percent" class="form-control" value="<%= html.html_escape(view.critical_percent.value) %>" min="1" max="100">
+								<span class="input-group-addon" title="Notice — renewal window opens">🔵</span>
+								<input type="number" name="notice_percent" class="form-control" value="<%= html.html_escape(view.notice_percent.value) %>" min="1" max="100">
 								<span class="input-group-addon">%</span>
 							</div>
 						</div>
@@ -121,13 +92,13 @@
 						</div>
 						<div class="col-xs-4">
 							<div class="input-group">
-								<span class="input-group-addon" title="Notice">🔵</span>
-								<input type="number" name="notice_percent" class="form-control" value="<%= html.html_escape(view.notice_percent.value) %>" min="1" max="100">
+								<span class="input-group-addon" title="Critical">🔴</span>
+								<input type="number" name="critical_percent" class="form-control" value="<%= html.html_escape(view.critical_percent.value) %>" min="1" max="100">
 								<span class="input-group-addon">%</span>
 							</div>
 						</div>
 					</div>
-					<p class="help-block">Percentage of total lifetime remaining for short-lived (WiFi/IoT) certs.</p>
+					<p class="help-block"><%= html.html_escape(view.notice_percent.descr) %></p>
 				</div>
 			</div>
 

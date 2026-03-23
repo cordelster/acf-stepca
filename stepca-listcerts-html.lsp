@@ -45,7 +45,8 @@
 					<th>Certificate Name</th>
 					<th>Common Name</th>
 					<th>Type</th>
-					<th>Days Remaining</th>
+					<th>Issuance</th>
+					<th>Remaining</th>
 					<th>Status</th>
 					<th>Actions</th>
 				</tr>
@@ -73,7 +74,21 @@
 					</td>
 					<td><%= html.html_escape(cert.subject.value) %></td>
 					<td><%= html.html_escape(cert.cert_type.value) %></td>
-					<td><strong><%= html.html_escape(cert.days_remaining.value) %></strong> days</td>
+					<td>
+						<% if cert.issuance_status then %>
+						<%
+							local is_label = "default"
+							if cert.issuance_status.value == "Active" then is_label = "success"
+							elseif cert.issuance_status.value == "Superseded" then is_label = "warning"
+							elseif cert.issuance_status.value == "Revoked" then is_label = "danger"
+							end
+						%>
+						<span class="label label-<%= is_label %>"><%= html.html_escape(cert.issuance_status.value) %></span>
+						<% else %>
+						<span class="label label-default">â</span>
+						<% end %>
+					</td>
+					<td><strong><%= html.html_escape(cert.days_remaining.value) %></strong></td>
 					<td>
 						<%
 							local emoji = ""
@@ -100,7 +115,7 @@
 						</span>
 					</td>
 					<td>
-						<a href="<%= html.html_escape(page_info.script .. page_info.prefix .. page_info.controller .. "/viewcert?cert_name=" .. cert.name.value) %>"
+						<a href="<%= html.html_escape(page_info.script .. page_info.prefix .. page_info.controller .. "/viewcert?serial=" .. cert.serial.value) %>"
 							class="btn btn-xs btn-info"
 							title="View certificate details">
 							<i class="icon-eye-open"></i> View
@@ -134,7 +149,7 @@
 							<i class="icon-lock"></i> Protected
 						</span>
 						<% else %>
-						<a href="<%= html.html_escape(page_info.script .. page_info.prefix .. page_info.controller .. "/revokecert?cert_name=" .. cert.name.value .. "&serial=" .. cert.serial.value) %>"
+						<a href="<%= html.html_escape(page_info.script .. page_info.prefix .. page_info.controller .. "/revokecert?serial=" .. cert.serial.value) %>"
 							class="btn btn-xs btn-danger"
 							onclick="return confirmRevoke('<%= html.html_escape(cert.name.value) %>');">
 							<i class="icon-ban-circle"></i> Revoke

@@ -43,6 +43,25 @@
 	</div>
 </div>
 
+<% if view.prov_type and view.prov_type.value == "ACME" then %>
+<div class="panel panel-warning">
+	<div class="panel-heading">
+		<h3 class="panel-title">ACME Client Setup</h3>
+	</div>
+	<div class="panel-body">
+		<p><strong>ACME Directory URL:</strong></p>
+		<pre><%= html.html_escape("https://<CA_HOST>:<PORT>/acme/" .. view.prov_name.value .. "/directory") %></pre>
+		<p><small>Point certbot, acme.sh, or <code>step ca certificate --acme</code> at this URL. The actual host/port is shown in your CA configuration.</small></p>
+		<div style="margin-top: 10px;">
+			<a href="<%= html.html_escape(page_info.script .. page_info.prefix .. page_info.controller .. "/acmeeab?acme_prov=" .. view.prov_name.value) %>"
+				class="btn btn-warning btn-sm">
+				<i class="icon-key"></i> Manage EAB Keys
+			</a>
+		</div>
+	</div>
+</div>
+<% end %>
+
 <div class="form-group" style="margin-top: 20px;">
 	<button type="button" class="btn btn-info" onclick="window.location.href='<%= html.html_escape(page_info.script .. page_info.prefix .. page_info.controller .. "/provisionerclaims?prov_name=" .. view.prov_name.value) %>'">
 		<i class="icon-time"></i> Edit Claims
